@@ -1,7 +1,7 @@
-from OptimalHeding.Simulator import BaseSimulator
-from OptimalHeding.GBM import GBMSimulator
-from OptimalHeding.Heston import HestonSimulator
-from OptimalHeding.JumpDiff import JumpDiffusionSimulator
+from OptimalHedging.Simulator import BaseSimulator
+from OptimalHedging.GBM import GBMSimulator
+from OptimalHedging.Heston import HestonSimulator
+from OptimalHedging.JumpDiff import JumpDiffusionSimulator
 
 __all__ = [
     "BaseSimulator",
