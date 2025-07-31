@@ -32,63 +32,71 @@ class GBMSimulator(BaseSimulator):
     
     def simulate_H(self, K: float) -> np.ndarray:
         """
-        Backward simulation of H_t using BSDE regression scheme.
+        Backward estimation of H_t and its derivatives using a Longstaff–Schwartz style regression.
 
-        This method uses self.S_paths and self.dW, which must have been generated 
+        This method uses the stored asset paths self.S_paths, which must be generated
         previously by calling simulate_S().
 
         Parameters
         ----------
         K : float
-            Strike price for the European call option.
+            Strike price for the terminal payoff.
 
         Returns
         -------
         H : ndarray, shape (M, N)
-            Backward simulated values of H_t.
+            Backward estimated values of H_t.
         dH_dS : ndarray, shape (M, N)
-            Estimated first derivative with respect to S.
+            Estimated ∂H/∂S.
         d2H_dSS : ndarray, shape (M, N)
-            Estimated second derivative with respect to S.
+            Estimated ∂²H/∂S².
         dH_dt : ndarray, shape (M, N)
-            Estimated time derivative.
+            Estimated ∂H/∂t.
         """
-        S_paths = self.S_path
-        dW = self.dW
+        S_path = self.S_path
+        M, N = S_path.shape
 
-        M, N = S_paths.shape
+        # Initialize arrays
         H = np.zeros((M, N))
         dH_dS = np.zeros((M, N))
         d2H_dSS = np.zeros((M, N))
         dH_dt = np.zeros((M, N))
 
         # Terminal condition
-        H[:, -1] = np.maximum(S_paths[:, -1] - K, 0)
+        H[:, -1] = np.maximum(S_path[:, -1] - K, 0)
 
-        # Backward iteration over time steps
+        # Backward iteration with polynomial regression
         for n in reversed(range(N - 1)):
-            S_n = S_paths[:, n]
-            dW_n = dW[:, n]
+            S_n = S_path[:, n]
+            Y = H[:, n + 1]
 
-            # Linear regression to estimate alpha and beta
-            X = np.column_stack((np.full(M, self.dt), dW_n))
-            Y = H[:, n+1]
+            # Regression basis [1, S, S^2]
+            X = np.column_stack((np.ones(M), S_n, S_n**2))
+
+            # Solve least squares for coefficients
             coeffs, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-            alpha_n, beta_n = coeffs
+            a0, a1, a2 = coeffs
 
-            # Update H_n for all paths
-            H[:, n] = H[:, n+1] - alpha_n * self.dt - beta_n * dW_n
+            # Fitted H_n from regression
+            H_fit = a0 + a1 * S_n + a2 * (S_n**2)
+            H[:, n] = np.maximum(H_fit, 0)
 
-            # Compute derivatives
-            dH_dS[:, n] = beta_n / (self.sigma * S_n)
-            d2H_dSS[:, n] = 2 * (alpha_n - self.mu * S_n * dH_dS[:, n]) / (self.sigma**2 * S_n**2)
-            dH_dt[:, n] = ((H[:, n+1] - H[:, n]) / self.dt
+            # Derivatives from regression coefficients
+            dH_dS[:, n] = a1 + 2 * a2 * S_n
+            d2H_dSS[:, n] = 2 * a2
+
+            # Time derivative using Itô's formula
+            dH_dt[:, n] = ((H[:, n + 1] - H[:, n]) / self.dt
                         - self.mu * S_n * dH_dS[:, n]
                         - 0.5 * self.sigma**2 * S_n**2 * d2H_dSS[:, n])
-        
-        self.H = H
-        self.dH_dS = dH_dS
-        self.d2H_dSS = d2H_dSS
-        self.dH_dt = dH_dt
+            
+            self.H = H
+            self.dh_dS = dH_dS
+            self.d2H_dSS = d2H_dSS
+            self.dH_dt = dH_dt
 
-        return self.H, self.dH_dS, self.d2H_dSS, self.dH_dt
+        return H, dH_dS, d2H_dSS, dH_dt
+    
+    
+    def simulate_L(self, h0: float) -> np.ndarray:
+        return super().simulate_L()

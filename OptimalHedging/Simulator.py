@@ -79,9 +79,17 @@ class BaseSimulator(ABC):
         pass
 
     @abstractmethod
-    def simulate_H(self, S_paths, dW, K):
+    def simulate_H(self, K: float):
         """
         Backward simulation of H_t.
+        To be implemented by subclasses (or a generic version in BaseSimulator).
+        """
+        pass
+
+    @abstractmethod
+    def simulate_L(self, h0: float):
+        """
+        Simulation of L_t.
         To be implemented by subclasses (or a generic version in BaseSimulator).
         """
         pass
