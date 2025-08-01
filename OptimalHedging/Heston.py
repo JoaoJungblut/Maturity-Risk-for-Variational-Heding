@@ -1,5 +1,6 @@
 from OptimalHedging.Simulator import BaseSimulator
 import numpy as np
+from sklearn.linear_model import Ridge
 
 class HestonSimulator(BaseSimulator):
     """
@@ -75,38 +76,44 @@ class HestonSimulator(BaseSimulator):
 
     def simulate_H(self) -> tuple:
         """
-        Backward estimation of H_t and its derivatives for the Heston model.
-
-        Uses regression to estimate H(S, v, t) and its spatial derivatives.
-
-        Parameters
-        ----------
-        K : float
-            Strike price.
+        Backward estimation of H_t and its derivatives for the Heston model,
+        where S_n and v_n are min–max scaled to [0,1] inside the regression step.
+        All derivatives are computed consistently with scaled variables.
 
         Returns
         -------
         H : ndarray (M, N)
             Estimated H_t.
         dH_dS : ndarray (M, N)
-            ∂H/∂S
+            ∂H/∂S (already scaled to [0,1]).
         d2H_dSS : ndarray (M, N)
-            ∂²H/∂S²
+            ∂²H/∂S² (already scaled to [0,1]).
         dH_dt : ndarray (M, N)
-            ∂H/∂t (estimated via Itô)
+            ∂H/∂t (already scaled to [0,1]).
         dH_dv : ndarray (M, N)
-            ∂H/∂v
+            ∂H/∂v (already scaled to [0,1]).
         d2H_dvv : ndarray (M, N)
-            ∂²H/∂v²
+            ∂²H/∂v² (already scaled to [0,1]).
         d2H_dSv : ndarray (M, N)
-            ∂²H/∂S∂v
+            ∂²H/∂S∂v (already scaled to [0,1]).
         """
+
+        from sklearn.linear_model import Ridge
+        import numpy as np
+
+        # --- helper for min–max scaling (used at each step) ---
+        def minmax(x):
+            x_min, x_max = np.min(x), np.max(x)
+            if np.isclose(x_max, x_min):
+                return np.zeros_like(x), 1.0, 0.0
+            return (x - x_min) / (x_max - x_min), x_max, x_min
 
         S = self.S_path
         v = self.v_path
         K = self.K
         M, N = S.shape
 
+        # --- allocate arrays ---
         H = np.zeros((M, N))
         dH_dS = np.zeros((M, N))
         d2H_dSS = np.zeros((M, N))
@@ -115,52 +122,58 @@ class HestonSimulator(BaseSimulator):
         d2H_dSv = np.zeros((M, N))
         dH_dt = np.zeros((M, N))
 
-        # Terminal payoff
+        # --- terminal payoff ---
         H[:, -1] = np.maximum(S[:, -1] - K, 0)
 
-        # Backward induction
+        # === backward iteration ===
         for n in reversed(range(N - 1)):
             S_n = S[:, n]
             v_n = v[:, n]
             Y = H[:, n + 1]
 
-            # Basis: 1, S, S², v, v², S*v
+            # === min–max scaling of state variables ===
+            S_scaled, S_max, S_min = minmax(S_n)
+            v_scaled, v_max, v_min = minmax(v_n)
+
+            # === build polynomial basis using scaled variables ===
             X = np.column_stack((
                 np.ones(M),
-                S_n,
-                S_n**2,
-                v_n,
-                v_n**2,
-                S_n * v_n
+                S_scaled,
+                S_scaled**2,
+                v_scaled,
+                v_scaled**2,
+                S_scaled * v_scaled
             ))
 
-            coeffs, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-            a0, a1, a2, a3, a4, a5 = coeffs
+            # === ridge regression ===
+            ridge = Ridge(alpha=1e-3, fit_intercept=False)
+            ridge.fit(X, Y)
+            a0, a1, a2, a3, a4, a5 = ridge.coef_
 
-            # Fit H
-            H_fit = (a0 + a1 * S_n + a2 * S_n**2
-                        + a3 * v_n + a4 * v_n**2
-                        + a5 * S_n * v_n)
+            # === fitted H (uses scaled variables directly) ===
+            H_fit = (a0 + a1 * S_scaled + a2 * S_scaled**2
+                    + a3 * v_scaled + a4 * v_scaled**2
+                    + a5 * S_scaled * v_scaled)
             H[:, n] = np.maximum(H_fit, 0)
 
-            # Derivatives
-            dH_dS[:, n] = a1 + 2 * a2 * S_n + a5 * v_n
-            d2H_dSS[:, n] = 2 * a2
-            dH_dv[:, n] = a3 + 2 * a4 * v_n + a5 * S_n
-            d2H_dvv[:, n] = 2 * a4
+            # === derivatives (computed in scaled space and clipped) ===
+            dH_dS[:, n] = a1 + 2 * a2 * S_scaled + a5 * v_scaled
+            d2H_dSS[:, n] = np.clip(2 * a2, -5, 5)
+            dH_dv[:, n] = np.clip(a3 + 2 * a4 * v_scaled + a5 * S_scaled, -10, 10)
+            d2H_dvv[:, n] = np.clip(2 * a4, -5, 5)
             d2H_dSv[:, n] = a5
 
-            # Time derivative from full Itô formula (drift only)
-            dH_dt[:, n] = (
+            dH_dt[:, n] = np.clip(
                 (H[:, n+1] - H[:, n]) / self.dt
-                - self.mu * S_n * dH_dS[:, n]
-                - self.kappa * (self.theta - v_n) * dH_dv[:, n]
-                - 0.5 * v_n * S_n**2 * d2H_dSS[:, n]
-                - 0.5 * self.sigma_v**2 * v_n * d2H_dvv[:, n]
-                - self.rho * self.sigma_v * S_n * v_n * d2H_dSv[:, n]
+                - self.mu * S_scaled * dH_dS[:, n]
+                - self.kappa * (self.theta - v_scaled) * dH_dv[:, n]
+                - 0.5 * v_scaled * S_scaled**2 * d2H_dSS[:, n]
+                - 0.5 * self.sigma_v**2 * v_scaled * d2H_dvv[:, n]
+                - self.rho * self.sigma_v * S_scaled * v_scaled * d2H_dSv[:, n],
+                -2, 2
             )
 
-        # Save in object
+        # --- store scaled results ---
         self.H = H
         self.dH_dS = dH_dS
         self.d2H_dSS = d2H_dSS
