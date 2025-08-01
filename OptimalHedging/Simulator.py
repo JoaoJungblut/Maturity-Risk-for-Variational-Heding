@@ -93,3 +93,27 @@ class BaseSimulator(ABC):
         To be implemented by subclasses (or a generic version in BaseSimulator).
         """
         pass
+
+    @abstractmethod
+    def generate_adj(self):
+        """
+        Generation of adjoint process p, q, r.
+        To be implemented by subclasses (or a generic version in BaseSimulator).
+        """
+        pass
+
+    @abstractmethod
+    def update_control(self):
+        """
+        Control Update and Convergence Criterion
+        To be implemented by subclasses (or a generic version in BaseSimulator).
+        """
+        pass
+
+    @abstractmethod
+    def update_L(self):
+        """
+        Forward simulation of the profit process L_t using the optimal hedge h_opt.
+        To be implemented by subclasses (or a generic version in BaseSimulator).
+        """
+        pass
