@@ -87,7 +87,7 @@ class GBMSimulator(BaseSimulator):
             d2H_dSS[:, n] = 2 * a2
 
             # Time derivative using Itô's formula
-            dH_dt[:, n] = ((H[:, n + 1] - H[:, n]) / self.dt
+            dH_dt[:, n] = ((H[:, n + 1] - H[:, n]) / (2*self.dt) # central difference
                         - self.mu * S_n * dH_dS[:, n]
                         - 0.5 * self.sigma**2 * S_n**2 * d2H_dSS[:, n])
         
