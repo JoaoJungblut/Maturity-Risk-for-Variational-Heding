@@ -91,12 +91,52 @@ class GBMSimulator(BaseSimulator):
                         - 0.5 * self.sigma**2 * S_n**2 * d2H_dSS[:, n])
             
             self.H = H
-            self.dh_dS = dH_dS
+            self.dH_dS = dH_dS
             self.d2H_dSS = d2H_dSS
             self.dH_dt = dH_dt
 
         return H, dH_dS, d2H_dSS, dH_dt
     
+
+    def simulate_L(self, h0=0.5) -> np.ndarray:
+        """
+        Forward simulation of the profit process L_t.
+
+        Parameters
+        ----------
+        S_path : ndarray (M, N)
+        h : ndarray (M, N)
+        dH_dS, d2H_dSS, dH_dt : ndarray (M, N)
+        mu, sigma : floats
+        dW : ndarray (M, N-1)
+        dt : float
+
+        Returns
+        -------
+        L : ndarray (M, N)
+        """
+        M, N = self.S_path.shape
+
+        S_n = self.S_path[:, :-1]
+        h_n = np.full_like(S_n, h0)
+        dH_dS = self.dH_dS[:, :-1]
+        dH_SS = self.d2H_dSS[:, :-1]
+        dH_dt = self.dH_dt[:, :-1]
+
+        # Drift and diffusion for profit and loss process
+        b_n = (h_n - dH_dS) * self.mu * S_n - dH_dt - 0.5 * self.sigma**2 * (S_n**2) * dH_SS
+        eta_n = (h_n - dH_dS) * self.sigma * S_n
+
+        # Increments
+        dL = b_n * self.dt + eta_n * self.dW
+
+        # Cumulative process
+        L = np.zeros((M, N))
+        L[:, 1:] = np.cumsum(dL, axis=1)
+
+        self.L = L
+
+        return L
     
-    def simulate_L(self, h0: float) -> np.ndarray:
-        return super().simulate_L()
+    
+
