@@ -37,11 +37,6 @@ class GBMSimulator(BaseSimulator):
         This method uses the stored asset paths self.S_paths, which must be generated
         previously by calling simulate_S().
 
-        Parameters
-        ----------
-        K : float
-            Strike price for the terminal payoff.
-
         Returns
         -------
         H : ndarray, shape (M, N)
@@ -250,6 +245,9 @@ class GBMSimulator(BaseSimulator):
             delta_p = p[:, n+1] - p[:, n]
             q[:, n] = np.mean(delta_p * dW[:, n]) / dt
 
+         # set terminal values to 0
+        q[:, -1] = 0.0
+
         self.p = p
         self.q = q
         return p, q
@@ -320,40 +318,57 @@ class GBMSimulator(BaseSimulator):
 
     def update_L(self) -> np.ndarray:
         """
-        Forward simulation of the profit process L_t using the optimal hedge h_opt.
+        Forward simulation of the profit process L_t under the Heston model
+        using the optimal hedge h_opt.
+
+        The dynamics follow:
+            dL_t = b_t^Heston dt + η1_t^Heston dW_t^S + η2_t^Heston dW_t^v,
 
         Parameters
         ----------
-        h_opt : ndarray (M, N) or (N,)
-            Optimal control values. Can be path-dependent (M x N) or
-            a single control curve (N,) applied to all trajectories.
+        None (uses self.h_opt and stored paths)
 
         Returns
         -------
         L_opt : ndarray (M, N)
             Simulated profit process under the optimal hedge.
         """
-
+        # === Retrieve simulated quantities ===
         M, N = self.S_path.shape
         h_opt = self.h_opt
         S_n = self.S_path[:, :-1]
-        dH_dS = self.dH_dS[:, :-1]
-        dH_SS = self.d2H_dSS[:, :-1]
-        dH_dt = self.dH_dt[:, :-1]
-        dW = self.dW
+        v_n = self.v_path[:, :-1]
+        dH_S = self.dH_dS[:, :-1]
+        d2H_SS = self.d2H_dSS[:, :-1]
+        dH_v = self.dH_dv[:, :-1]
+        d2H_vv = self.d2H_dvv[:, :-1]
+        d2H_Sv = self.d2H_dSv[:, :-1]
+        dH_t = self.dH_dt[:, :-1]
+        dW1 = self.dW1
+        dW2 = self.dW2
 
-        # Drift and diffusion terms
-        b_n = (h_opt[:, :-1] - dH_dS) * self.mu * S_n \
-            - dH_dt - 0.5 * self.sigma**2 * (S_n**2) * dH_SS
+        # === Drift term b_t^Heston ===
+        b_n = (
+            h_opt[:, :-1] * self.mu * S_n
+            - (dH_t
+            + self.mu * S_n * dH_S
+            + self.kappa * (self.theta - v_n) * dH_v
+            + 0.5 * v_n * S_n**2 * d2H_SS
+            + 0.5 * (self.sigma_v**2) * v_n * d2H_vv
+            + self.rho * self.sigma_v * v_n * S_n * d2H_Sv)
+        )
 
-        eta_n = (h_opt[:, :-1] - dH_dS) * self.sigma * S_n
+        # === Diffusion terms ===
+        eta1_n = (h_opt[:, :-1] - dH_S) * np.sqrt(v_n) * S_n
+        eta2_n = (h_opt[:, :-1] - dH_v) * self.sigma_v * np.sqrt(v_n)
 
-        # Increments of the profit process
-        dL = b_n * self.dt + eta_n * dW
+        # === Increments of L_t ===
+        dL = b_n * self.dt + eta1_n * dW1 + eta2_n * dW2
 
-        # Build profit process
+        # === Build cumulative profit process ===
         L_opt = np.zeros((M, N))
         L_opt[:, 1:] = np.cumsum(dL, axis=1)
 
+        # === Store and return ===
         self.L_opt = L_opt
         return L_opt
