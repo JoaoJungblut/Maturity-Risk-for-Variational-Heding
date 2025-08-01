@@ -17,6 +17,7 @@ class BaseSimulator(ABC):
                  S0: float,
                  mu: float,
                  sigma: float,
+                 K: float,
                  t0: float = 0.0,
                  T: float = 1.0,
                  N: int = 252,
@@ -48,6 +49,7 @@ class BaseSimulator(ABC):
         self.S0 = S0
         self.mu = mu 
         self.sigma = sigma
+        self.K = K
 
         self.t0 = t0
         self.T = T
@@ -79,7 +81,7 @@ class BaseSimulator(ABC):
         pass
 
     @abstractmethod
-    def simulate_H(self, K: float):
+    def simulate_H(self):
         """
         Backward simulation of H_t.
         To be implemented by subclasses (or a generic version in BaseSimulator).

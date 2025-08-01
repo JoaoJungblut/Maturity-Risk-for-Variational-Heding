@@ -30,7 +30,7 @@ class GBMSimulator(BaseSimulator):
         return S_path
     
     
-    def simulate_H(self, K: float) -> np.ndarray:
+    def simulate_H(self) -> np.ndarray:
         """
         Backward estimation of H_t and its derivatives using a Longstaff–Schwartz style regression.
 
@@ -55,6 +55,7 @@ class GBMSimulator(BaseSimulator):
         """
         S_path = self.S_path
         M, N = S_path.shape
+        K = self.K
 
         # Initialize arrays
         H = np.zeros((M, N))
@@ -89,8 +90,7 @@ class GBMSimulator(BaseSimulator):
             dH_dt[:, n] = ((H[:, n + 1] - H[:, n]) / self.dt
                         - self.mu * S_n * dH_dS[:, n]
                         - 0.5 * self.sigma**2 * S_n**2 * d2H_dSS[:, n])
-            
-            self.K = K
+        
             self.H = H
             self.dH_dS = dH_dS
             self.d2H_dSS = d2H_dSS
@@ -255,7 +255,7 @@ class GBMSimulator(BaseSimulator):
         return p, q
 
 
-    def update_control(self, eps=1e-4, max_iter=1000) -> np.ndarray:
+    def update_control(self, eps=1e-4, max_iter=50) -> np.ndarray:
         """
         Control Update and Convergence Criterion
 
