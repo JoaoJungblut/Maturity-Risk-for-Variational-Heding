@@ -59,7 +59,7 @@ class BaseSimulator(ABC):
         self.seed = seed
 
         # compute time increment and grid
-        self.dt = (T - t0) / N
+        self.dt = T / N
         self.time_grid = np.linspace(t0, T, N + 1)
 
         # initialize random number generator if seed is given

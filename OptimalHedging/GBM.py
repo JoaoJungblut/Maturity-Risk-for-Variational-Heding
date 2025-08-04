@@ -16,13 +16,13 @@ class GBMSimulator(BaseSimulator):
         S : ndarray, shape (M, N+1)
             Simulated GBM asset price paths.
         """
-
+        steps = int(np.round((self.T - self.t0) / self.dt))
         dW = np.random.normal(loc=0.0, 
                                    scale=np.sqrt(self.dt), 
-                                   size=(self.M, self.N - 1))           # Generate Brownian increments (M x N-1) as N(0,1) 
-        factors = 1 + self.mu * self.dt + self.sigma * dW               # Compute multiplicative factors for all steps
-        factors = np.hstack((np.ones((self.M, 1)), factors))            # Insert a column of ones for the initial asset value
-        S_path = self.S0 * np.cumprod(factors, axis=1)                  # Cumulative product along time to build paths
+                                   size=(self.M, steps - 1))    # Generate Brownian increments (M x N-1) as N(0,1) 
+        factors = 1 + self.mu * self.dt + self.sigma * dW       # Compute multiplicative factors for all steps
+        factors = np.hstack((np.ones((self.M, 1)), factors))    # Insert a column of ones for the initial asset value
+        S_path = self.S0 * np.cumprod(factors, axis=1)          # Cumulative product along time to build paths
 
         self.S_path = S_path
         self.dW = dW
