@@ -1,493 +1,524 @@
 from OptimalHedging.Simulator import BaseSimulator
 import numpy as np
-from sklearn.linear_model import Ridge
+from typing import Dict, List, Tuple
+
 
 class HestonSimulator(BaseSimulator):
     """
-    Simulator for the Heston stochastic volatility model.
+    Heston ('Reston') + máquina de hedge igual ao GBM,
+    mas com gradiente ∂_h H próprio do modelo.
     """
 
-    def __init__(self,
-                 v0: float,
-                 kappa: float,
-                 theta: float,
-                 sigma_v: float,
-                 rho: float,
-                 **kwargs):
+    def __init__(
+        self,
+        kappa: float,
+        theta: float,
+        sigma_v: float,
+        rho: float,
+        v0: float,
+        **base_kwargs,
+    ):
         """
-        Additional parameters for the Heston model:
-        - v0      : initial variance
-        - kappa   : rate of mean reversion of variance
-        - theta   : long-term variance level
-        - sigma_v : volatility of variance
-        - rho     : correlation between dW1 and dW2
+        base_kwargs = mesmos argumentos do GBMSimulator/BaseSimulator:
+            M, S0, K, mu, sigma (pode ser usado só como ref), t0, T, dt, etc.
         """
-        super().__init__(**kwargs)
-        self.v0 = v0
-        self.kappa = kappa
-        self.theta = theta
-        self.sigma_v = sigma_v
-        self.rho = rho
+        super().__init__(**base_kwargs)
+        self.kappa = float(kappa)
+        self.theta = float(theta)
+        self.sigma_v = float(sigma_v)
+        self.rho   = float(rho)
+        self.v0    = float(v0)
+
+    # ============================================================
+    # 0. Underlying S,v and derivative H
+    # ============================================================
 
     def simulate_S(self) -> np.ndarray:
         """
-        Simulate Heston model using Euler–Maruyama with correlated Brownian motions:
+        Heston Euler:
+
             dS = mu * S * dt + sqrt(v) * S * dW1
-            dv = kappa * (theta - v) * dt + sigma_v * sqrt(v) * dW2
-            Corr(dW1, dW2) = rho 
+            dv = kappa*(theta - v)*dt + sigma_v*sqrt(v)*dW2,
 
-        Returns
-        -------
-        S : ndarray, shape (M, N+1)
-            Simulated asset price paths.
-        v : ndarray, shape (M, N+1)
-            Simulated variance paths.
+        corr(dW1,dW2) = rho.
         """
+        steps = int(np.round((self.T - self.t0) / self.dt))
+        M = self.M
+        dt = self.dt
 
-        # --- Generate correlated Brownian increments ---
-        cov = np.array([[1.0, self.rho],
-                        [self.rho, 1.0]])
-        dW = np.random.multivariate_normal(mean=[0.0, 0.0], cov=cov, size=(self.M, self.N - 1))
-        dW *= np.sqrt(self.dt)
-        self.dW1 = dW[:, :, 0]
-        self.dW2 = dW[:, :, 1]
+        Z1 = np.random.normal(0.0, 1.0, size=(M, steps - 1))
+        Z2 = np.random.normal(0.0, 1.0, size=(M, steps - 1))
 
-        # --- Initialize paths ---
-        S = np.zeros((self.M, self.N))
-        v = np.zeros((self.M, self.N))
+        dW1 = np.sqrt(dt) * Z1                # Browniano de S
+        dW2_ind = np.sqrt(dt) * Z2
+        dW2 = self.rho * dW1 + np.sqrt(1.0 - self.rho**2) * dW2_ind  # Browniano de v
+
+        S = np.zeros((M, steps))
+        v = np.zeros((M, steps))
+
         S[:, 0] = self.S0
         v[:, 0] = self.v0
 
-        # --- Alfonsi updates for v_t ---
-        for n in range(1, self.N):
-            v_prev = v[:, n-1]
-            v[:, n] = (v_prev + self.kappa * self.theta * self.dt
-                    + self.sigma_v * np.sqrt(v_prev) * self.dW2[:, n-1]
-                    + 0.25 * self.sigma_v**2 * self.dt) / (1 + self.kappa * self.dt)
+        for n in range(steps - 1):
+            Sn = S[:, n]
+            vn = np.maximum(v[:, n], 1e-8)
 
-        # --- Euler additive for S_t ---
-        increments = 1 + self.mu * self.dt + np.sqrt(v[:, :-1]) * self.dW1
-        S[:, 1:] = self.S0 * np.cumprod(increments, axis=1)
-
-        self.v_path = v
-        self.S_path = S
-        return self.S_path, self.v_path
-    
-
-    def simulate_H(self) -> tuple:
-        """
-        Backward estimation of H_t and its derivatives for the Heston model,
-        where S_n and v_n are min–max scaled to [0,1] inside the regression step.
-        All derivatives are computed consistently with scaled variables.
-
-        Returns
-        -------
-        H : ndarray (M, N)
-            Estimated H_t.
-        dH_dS : ndarray (M, N)
-            ∂H/∂S (already scaled to [0,1]).
-        d2H_dSS : ndarray (M, N)
-            ∂²H/∂S² (already scaled to [0,1]).
-        dH_dt : ndarray (M, N)
-            ∂H/∂t (already scaled to [0,1]).
-        dH_dv : ndarray (M, N)
-            ∂H/∂v (already scaled to [0,1]).
-        d2H_dvv : ndarray (M, N)
-            ∂²H/∂v² (already scaled to [0,1]).
-        d2H_dSv : ndarray (M, N)
-            ∂²H/∂S∂v (already scaled to [0,1]).
-        """
-
-        from sklearn.linear_model import Ridge
-        import numpy as np
-
-        # --- helper for min–max scaling (used at each step) ---
-        def minmax(x):
-            x_min, x_max = np.min(x), np.max(x)
-            if np.isclose(x_max, x_min):
-                return np.zeros_like(x), 1.0, 0.0
-            return (x - x_min) / (x_max - x_min), x_max, x_min
-
-        S = self.S_path
-        v = self.v_path
-        K = self.K
-        M, N = S.shape
-
-        # --- allocate arrays ---
-        H = np.zeros((M, N))
-        dH_dS = np.zeros((M, N))
-        d2H_dSS = np.zeros((M, N))
-        dH_dv = np.zeros((M, N))
-        d2H_dvv = np.zeros((M, N))
-        d2H_dSv = np.zeros((M, N))
-        dH_dt = np.zeros((M, N))
-
-        # --- terminal payoff ---
-        H[:, -1] = np.maximum(S[:, -1] - K, 0)
-
-        # === backward iteration ===
-        for n in reversed(range(N - 1)):
-            S_n = S[:, n]
-            v_n = v[:, n]
-            Y = H[:, n + 1]
-
-            # === min–max scaling of state variables ===
-            S_scaled, S_max, S_min = minmax(S_n)
-            v_scaled, v_max, v_min = minmax(v_n)
-
-            # === build polynomial basis using scaled variables ===
-            X = np.column_stack((
-                np.ones(M),
-                S_scaled,
-                S_scaled**2,
-                v_scaled,
-                v_scaled**2,
-                S_scaled * v_scaled
-            ))
-
-            # === ridge regression ===
-            ridge = Ridge(alpha=1e-3, fit_intercept=False)
-            ridge.fit(X, Y)
-            a0, a1, a2, a3, a4, a5 = ridge.coef_
-
-            # === fitted H (uses scaled variables directly) ===
-            H_fit = (a0 + a1 * S_scaled + a2 * S_scaled**2
-                    + a3 * v_scaled + a4 * v_scaled**2
-                    + a5 * S_scaled * v_scaled)
-            H[:, n] = np.maximum(H_fit, 0)
-
-            # === derivatives (computed in scaled space and clipped) ===
-            dH_dS[:, n] = a1 + 2 * a2 * S_scaled + a5 * v_scaled
-            d2H_dSS[:, n] = np.clip(2 * a2, -5, 5)
-            dH_dv[:, n] = np.clip(a3 + 2 * a4 * v_scaled + a5 * S_scaled, -10, 10)
-            d2H_dvv[:, n] = np.clip(2 * a4, -5, 5)
-            d2H_dSv[:, n] = a5
-
-            dH_dt[:, n] = np.clip(
-                (H[:, n+1] - H[:, n]) / self.dt
-                - self.mu * S_scaled * dH_dS[:, n]
-                - self.kappa * (self.theta - v_scaled) * dH_dv[:, n]
-                - 0.5 * v_scaled * S_scaled**2 * d2H_dSS[:, n]
-                - 0.5 * self.sigma_v**2 * v_scaled * d2H_dvv[:, n]
-                - self.rho * self.sigma_v * S_scaled * v_scaled * d2H_dSv[:, n],
-                -2, 2
+            S[:, n + 1] = Sn + self.mu * Sn * dt + np.sqrt(vn) * Sn * dW1[:, n]
+            v[:, n + 1] = (
+                vn
+                + self.kappa * (self.theta - vn) * dt
+                + self.sigma_v * np.sqrt(vn) * dW2[:, n]
             )
+            v[:, n + 1] = np.maximum(v[:, n + 1], 1e-8)
 
-        # --- store scaled results ---
+        self.S_path = S
+        self.v_path = v
+        self.dW = dW1  # para o adjunto, usamos o browniano de S
+
+        return S
+
+    def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                  np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Mesmo esquema do GBM, mas os inner paths são Heston.
+        H(t,S) (dependência em v é "integrada" via a simulação).
+        """
+        S_path = self.S_path
+        v_path = self.v_path
+        M, N_time = S_path.shape
+        K_strike = self.K
+        mu = self.mu
+        dt = self.dt
+
+        S_min = S_path.min()
+        S_max = S_path.max()
+        margin = 0.1 * (S_max - S_min)
+        S_min -= margin
+        S_max += margin
+
+        n_S_grid = 50
+        n_inner = 200
+
+        S_grid = np.linspace(S_min, S_max, n_S_grid)
+
+        H_grid = np.zeros((N_time, n_S_grid))
+        Delta_grid = np.zeros((N_time, n_S_grid))
+        Gamma_grid = np.zeros((N_time, n_S_grid))
+        dHdt_grid = np.zeros((N_time, n_S_grid))
+        d2H_dt_dS_grid = np.zeros((N_time, n_S_grid))
+        d3H_dS3_grid = np.zeros((N_time, n_S_grid))
+
+        # terminal
+        H_grid[-1, :] = np.maximum(S_grid - K_strike, 0.0)
+
+        # backward em t – nested MC Heston
+        for n in reversed(range(N_time - 1)):
+            # v médio na data (para iniciar inner paths)
+            v_mean_n = float(np.mean(v_path[:, n]))
+            v_mean_n = max(v_mean_n, 1e-8)
+
+            for k, s0 in enumerate(S_grid):
+                S_inner = np.full(n_inner, s0, float)
+                v_inner = np.full(n_inner, v_mean_n, float)
+
+                for j in range(n, N_time - 1):
+                    Z1 = np.random.normal(0.0, 1.0, size=n_inner)
+                    Z2 = np.random.normal(0.0, 1.0, size=n_inner)
+                    dW1_inner = np.sqrt(dt) * Z1
+                    dW2_ind_inner = np.sqrt(dt) * Z2
+                    dW2_inner = self.rho * dW1_inner + np.sqrt(1.0 - self.rho**2) * dW2_ind_inner
+
+                    v_inner = np.maximum(v_inner, 1e-8)
+                    S_inner = S_inner + mu * S_inner * dt + np.sqrt(v_inner) * S_inner * dW1_inner
+                    v_inner = (
+                        v_inner
+                        + self.kappa * (self.theta - v_inner) * dt
+                        + self.sigma_v * np.sqrt(v_inner) * dW2_inner
+                    )
+                    v_inner = np.maximum(v_inner, 1e-8)
+
+                payoff_inner = np.maximum(S_inner - K_strike, 0.0)
+                H_grid[n, k] = payoff_inner.mean()
+
+        # derivadas espaciais em S (como no GBM)
+        dS = S_grid[1] - S_grid[0]
+
+        for n in range(N_time):
+            for k in range(1, n_S_grid - 1):
+                Delta_grid[n, k] = (H_grid[n, k + 1] - H_grid[n, k - 1]) / (2.0 * dS)
+                Gamma_grid[n, k] = (H_grid[n, k + 1] - 2.0 * H_grid[n, k] + H_grid[n, k - 1]) / (dS ** 2)
+
+            Delta_grid[n, 0] = Delta_grid[n, 1]
+            Delta_grid[n, -1] = Delta_grid[n, -2]
+            Gamma_grid[n, 0] = Gamma_grid[n, 1]
+            Gamma_grid[n, -1] = Gamma_grid[n, -2]
+
+            for k in range(1, n_S_grid - 1):
+                d3H_dS3_grid[n, k] = (Gamma_grid[n, k + 1] - Gamma_grid[n, k - 1]) / (2.0 * dS)
+
+            d3H_dS3_grid[n, 0] = d3H_dS3_grid[n, 1]
+            d3H_dS3_grid[n, -1] = d3H_dS3_grid[n, -2]
+
+        # derivadas em t
+        for n in range(1, N_time - 1):
+            dHdt_grid[n, :] = (H_grid[n + 1, :] - H_grid[n - 1, :]) / (2.0 * dt)
+        dHdt_grid[0, :] = (H_grid[1, :] - H_grid[0, :]) / dt
+        dHdt_grid[-1, :] = (H_grid[-1, :] - H_grid[-2, :]) / dt
+
+        # mista t,S
+        for n in range(N_time):
+            for k in range(1, n_S_grid - 1):
+                d2H_dt_dS_grid[n, k] = (dHdt_grid[n, k + 1] - dHdt_grid[n, k - 1]) / (2.0 * dS)
+            d2H_dt_dS_grid[n, 0] = d2H_dt_dS_grid[n, 1]
+            d2H_dt_dS_grid[n, -1] = d2H_dt_dS_grid[n, -2]
+
+        # interpola para as paths
+        H = np.zeros((M, N_time))
+        dH_dS = np.zeros((M, N_time))
+        d2H_dSS = np.zeros((M, N_time))
+        dH_dt = np.zeros((M, N_time))
+        d2H_dt_dS = np.zeros((M, N_time))
+        d3H_dS3 = np.zeros((M, N_time))
+
+        for n in range(N_time):
+            S_n = S_path[:, n]
+            H[:, n]          = np.interp(S_n, S_grid, H_grid[n, :])
+            dH_dS[:, n]      = np.interp(S_n, S_grid, Delta_grid[n, :])
+            d2H_dSS[:, n]    = np.interp(S_n, S_grid, Gamma_grid[n, :])
+            dH_dt[:, n]      = np.interp(S_n, S_grid, dHdt_grid[n, :])
+            d2H_dt_dS[:, n]  = np.interp(S_n, S_grid, d2H_dt_dS_grid[n, :])
+            d3H_dS3[:, n]    = np.interp(S_n, S_grid, d3H_dS3_grid[n, :])
+
+        self.S_grid = S_grid
+        self.H_grid = H_grid
+        self.Delta_grid = Delta_grid
+        self.Gamma_grid = Gamma_grid
+        self.dHdt_grid = dHdt_grid
+        self.d2H_dt_dS_grid = d2H_dt_dS_grid
+        self.d3H_dS3_grid = d3H_dS3_grid
+
+        dH_dt = dH_dt / 100.0
+        d2H_dt_dS = d2H_dt_dS / 100.0
+
         self.H = H
         self.dH_dS = dH_dS
         self.d2H_dSS = d2H_dSS
-        self.dH_dv = dH_dv
-        self.d2H_dvv = d2H_dvv
-        self.d2H_dSv = d2H_dSv
         self.dH_dt = dH_dt
+        self.d2H_dt_dS = d2H_dt_dS
+        self.d3H_dS3 = d3H_dS3
 
-        return H, dH_dS, d2H_dSS, dH_dt, dH_dv, d2H_dvv, d2H_dSv
+        return H, dH_dS, d2H_dSS, dH_dt, d2H_dt_dS, d3H_dS3
 
+    # ============================================================
+    # 1. Control initialization
+    # ============================================================
 
-    def simulate_L(self, h0=0.5) -> np.ndarray:
-        """
-        Forward simulation of the profit process L_t under the Heston model.
+    def init_control(self, kind: str = "delta") -> np.ndarray:
+        S_path = self.S_path
+        dH_dS = self.dH_dS
+        M, steps = S_path.shape
 
-        Parameters
-        ----------
-        h0 : float
-            Initial guess for control.
+        if kind == "delta":
+            h0 = dH_dS[:, :-1].copy()
+        elif kind == "zero":
+            h0 = np.zeros((M, steps - 1))
+        else:
+            raise ValueError("Unknown control initialization kind")
 
-        Returns
-        -------
-        L : ndarray (M, N)
-            Simulated profit process.
-        """
-        M, N = self.S_path.shape
+        return h0
 
-        # Extract stored quantities
-        S_n = self.S_path[:, :-1]
-        v_n = self.v_path[:, :-1]
-        dH_S = self.dH_dS[:, :-1]
-        d2H_SS = self.d2H_dSS[:, :-1]
-        dH_v = self.dH_dv[:, :-1]
-        d2H_vv = self.d2H_dvv[:, :-1]
-        d2H_Sv = self.d2H_dSv[:, :-1]
-        dH_t = self.dH_dt[:, :-1]
+    # ============================================================
+    # 2. Forward P&L
+    # ============================================================
 
-        # Initial control guess
-        h_n = np.full_like(S_n, h0)
+    def forward_PL(self, h: np.ndarray, L0: float = 0.0) -> np.ndarray:
+        S_path = self.S_path
+        H      = self.H
 
-        # Brownian increments
-        dW1 = self.dW1
-        dW2 = self.dW2
+        M, steps = S_path.shape
+        assert h.shape == (M, steps - 1)
 
-        # === Drift term b_t^{Heston} ===
-        b_n = (h_n * self.mu * S_n
-            - (dH_t
-                + self.mu * S_n * dH_S
-                + self.kappa * (self.theta - v_n) * dH_v
-                + 0.5 * v_n * S_n**2 * d2H_SS
-                + 0.5 * self.sigma_v**2 * v_n * d2H_vv
-                + self.rho * self.sigma_v * S_n * v_n * d2H_Sv))
+        L = np.zeros((M, steps))
+        L[:, 0] = L0
 
-        # === Diffusion terms eta_1 and eta_2 ===
-        eta1_n = h_n * np.sqrt(v_n) * S_n - np.sqrt(v_n) * S_n * dH_S
-        eta2_n = h_n * self.sigma_v * np.sqrt(v_n) - self.sigma_v * np.sqrt(v_n) * dH_v
+        for n in range(steps - 1):
+            dS = S_path[:, n + 1] - S_path[:, n]
+            dH = H[:, n + 1]      - H[:, n]
+            L[:, n + 1] = L[:, n] + h[:, n] * dS - dH
 
-        # === Increment dL ===
-        dL = b_n * self.dt + eta1_n * dW1 + eta2_n * dW2
-
-        # === Accumulate L ===
-        L = np.zeros((M, N))
-        L[:, 1:] = np.cumsum(dL, axis=1)
-
-        self.L = L
         return L
 
-    
-    def generate_adj(self, risk_type='ell', **kwargs):
-        """
-        Backward solution of the BSDE for the adjoint process p_t^(k),
-        including q_t^(k) and r_t^(k) for the Heston model.
+    # ============================================================
+    # 3. Risk functional  (mesmo do GBM)
+    # ============================================================
 
-        Parameters
-        ----------
-        risk_type : str
-            Type of risk measure:
-            'ell'  -> Expected Loss Linear
-            'ele'  -> Expected Loss Exponential
-            'elw'  -> Expected Loss Weibull
-            'entl' -> Entropic Linear
-            'ente' -> Entropic Exponential
-            'entw' -> Entropic Weibull
-            'es'   -> Expected Shortfall
-        **kwargs :
-            Optional parameters depending on risk_type:
-                a     : float -> risk aversion coefficient (entropic cases)
-                alpha : float -> threshold (expected shortfall)
-                beta  : float -> confidence level (expected shortfall)
+    @staticmethod
+    def risk_function(LT: np.ndarray, risk_type: str, **kwargs) -> float:
+        LT = np.asarray(LT)
 
-        Returns
-        -------
-        p : ndarray (M, N)
-            Backward adjoint process p_t^(k,m).
-        q : ndarray (M, N-1)
-            Auxiliary process q_n^(k,m) associated with dW^S.
-        r : ndarray (M, N-1)
-            Auxiliary process r_n^(k,m) associated with dW^v.
-        """
-        # === Load paths ===
-        S = self.S_path
-        L = self.L
-        v = self.v_path
-        dW1 = self.dW1
-        dW2 = self.dW2
-        dt = self.dt
-        M, N = S.shape
+        if risk_type == "ele":
+            a = kwargs.get("a")
+            if a is None:
+                raise ValueError("Parameter 'a' is required for 'ele'.")
+            rho = np.mean(np.exp(-a * LT))
 
-        # === Initialize storage ===
-        p = np.zeros((M, N))
-        q = np.zeros((M, N-1))
-        r = np.zeros((M, N-1))
+        elif risk_type == "elw":
+            k = kwargs.get("k")
+            if k is None:
+                raise ValueError("Parameter 'k' is required for 'elw'.")
+            loss = -np.minimum(LT, 0.0)
+            rho = np.mean(np.exp(loss**k))
 
-        # === Define terminal gradient and driver f(t,S,v,L,p) ===
-        if risk_type == 'ell':  # Expected Loss Linear
-            terminal_grad = lambda L: np.zeros_like(L)
-            f_func = lambda t, S, v, L, p: np.zeros_like(L)
+        elif risk_type == "entl":
+            gamma = kwargs.get("gamma")
+            if gamma is None:
+                raise ValueError("Parameter 'gamma' is required for 'entl'.")
+            w = np.exp(-gamma * LT)
+            den = np.mean(w)
+            rho = (1.0 / gamma) * np.log(den)
 
-        elif risk_type == 'ele':  # Expected Loss Exponential
-            terminal_grad = lambda L: np.ones_like(L)
-            f_func = lambda t, S, v, L, p: np.zeros_like(L)
+        elif risk_type == "ente":
+            gamma = kwargs.get("gamma")
+            a = kwargs.get("a")
+            if gamma is None or a is None:
+                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
+            v = np.exp(-a * LT)
+            w = np.exp(gamma * v)
+            den = np.mean(w)
+            rho = (1.0 / gamma) * np.log(den)
 
-        elif risk_type == 'elw':  # Expected Loss Weibull
-            k = kwargs.get('k', 2.0)
-            def terminal_grad(L):
-                pT = np.zeros_like(L)
-                mask = (L <= 0)
-                pT[mask] = -k * (-L[mask])**(k-1) * np.exp(-(-L[mask])**k)
-                return pT
-            f_func = lambda t, S, v, L, p: np.zeros_like(L)
+        elif risk_type == "entw":
+            gamma = kwargs.get("gamma")
+            k     = kwargs.get("k")
+            scale = kwargs.get("scale", 20.0)
+            if gamma is None or k is None:
+                raise ValueError("Parameters 'gamma' and 'k' are required for 'entw'.")
+            LT_scaled = LT / scale
+            loss = -np.minimum(LT_scaled, 0.0)
+            g = np.clip(loss**k, 0.0, 10.0)
+            v = np.exp(g)
+            z = np.clip(gamma * v, -20.0, 20.0)
+            w = np.exp(z)
+            den = np.mean(w)
+            rho = (1.0 / gamma) * np.log(den)
 
-        elif risk_type == 'entl':  # Entropic Linear
-            a = kwargs.get('a', 1.0)
-            terminal_grad = lambda L: a * np.exp(-a * L)
-            f_func = lambda t, S, v, L, p: -a * p
-
-        elif risk_type == 'ente':  # Entropic Exponential
-            a = kwargs.get('a', 1.0)
-            terminal_grad = lambda L: a * np.exp(-a * np.exp(-a * L))
-            f_func = lambda t, S, v, L, p: -a * p
-
-        elif risk_type == 'entw':  # Entropic Weibull
-            a = kwargs.get('a', 1.0)
-            k = kwargs.get('k', 2.0)
-            terminal_grad = lambda L: np.exp(-np.minimum(L, 0)**k)
-            f_func = lambda t, S, v, L, p: -a * p
-
-        elif risk_type == 'es':  # Expected Shortfall
-            alpha = kwargs.get('alpha', 0.05)
-            beta = kwargs.get('beta', 0.95)
-            def terminal_grad(L):
-                pT = np.zeros_like(L)
-                pT[L > alpha] = 1 / (1 - beta)
-                return pT
-            f_func = lambda t, S, v, L, p: np.zeros_like(L)
+        elif risk_type == "es":
+            beta = kwargs.get("beta")
+            if beta is None:
+                raise ValueError("Parameter 'beta' is required for 'es'.")
+            alpha = kwargs.get("alpha")
+            if alpha is None:
+                alpha = np.quantile(LT, beta)
+            excess = np.maximum(LT - alpha, 0.0)
+            rho = alpha + (1.0 / (1.0 - beta)) * np.mean(excess)
 
         else:
-            raise ValueError("Unknown risk_type")
+            raise ValueError(f"Unknown risk_type '{risk_type}'.")
 
-        # === Step 1: Terminal condition ===
-        p[:, -1] = terminal_grad(L[:, -1])
+        return rho
 
-        # === Step 2: Backward iteration using regression ===
-        for n in reversed(range(N-1)):
-            t_next = (n+1) * dt
-            S_next = S[:, n+1]
-            v_next = v[:, n+1]
-            L_next = L[:, n+1]
+    # ============================================================
+    # 4. Terminal adjoint (mesmo do GBM)
+    # ============================================================
+
+    @staticmethod
+    def terminal_adjoint(LT: np.ndarray, risk_type: str, **kwargs) -> Tuple[np.ndarray, Dict]:
+        LT = np.asarray(LT)
+
+        if risk_type == "ele":
+            a = kwargs.get("a")
+            if a is None:
+                raise ValueError("Parameter 'a' is required for 'ele'.")
+            pT = -a * np.exp(-a * LT)
+            info = {}
+
+        elif risk_type == "elw":
+            k = kwargs.get("k")
+            if k is None:
+                raise ValueError("Parameter 'k' is required for 'elw'.")
+            loss = -np.minimum(LT, 0.0)
+            pT = -k * (loss**(k - 1.0)) * np.exp(loss**k)
+            info = {}
+
+        elif risk_type == "entl":
+            gamma = kwargs.get("gamma")
+            if gamma is None:
+                raise ValueError("Parameter 'gamma' is required for 'entl'.")
+            w = np.exp(-gamma * LT)
+            den = np.mean(w)
+            if den <= 0.0:
+                raise ValueError("Non-positive denominator in entropic-linear.")
+            pT = -w / den
+            info = {"denominator": den}
+
+        elif risk_type == "ente":
+            gamma = kwargs.get("gamma")
+            a = kwargs.get("a")
+            if gamma is None or a is None:
+                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
+            v = np.exp(-a * LT)
+            w = np.exp(gamma * v)
+            den = np.mean(w)
+            if den <= 0.0:
+                raise ValueError("Non-positive denominator in entropic-exponential.")
+            pT = -a * v * w / den
+            info = {"denominator": den}
+
+        elif risk_type == "entw":
+            gamma = kwargs.get("gamma")
+            k     = kwargs.get("k")
+            scale = kwargs.get("scale", 20.0)
+            if gamma is None or k is None:
+                raise ValueError("Parameters 'gamma' and 'k' are required for 'entw'.")
+            LT_scaled = LT / scale
+            loss = -np.minimum(LT_scaled, 0.0)
+            g = np.clip(loss**k, 0.0, 10.0)
+            v = np.exp(g)
+            z = np.clip(gamma * v, -20.0, 20.0)
+            w = np.exp(z)
+            den = np.mean(w)
+            if den <= 0.0:
+                raise ValueError("Non-positive denominator in entropic-Weibull.")
+            v_prime = -k * (loss**(k - 1.0)) * v
+            p_base = v_prime * w / den
+            pT = (1.0 / scale) * p_base
+            info = {"denominator": den}
+
+        elif risk_type == "es":
+            beta = kwargs.get("beta")
+            if beta is None:
+                raise ValueError("Parameter 'beta' is required for 'es'.")
+            alpha = kwargs.get("alpha")
+            if alpha is None:
+                alpha = np.quantile(LT, beta)
+            indicator = (LT >= alpha).astype(float)
+            pT = indicator / (1.0 - beta)
+            info = {"alpha_star": alpha}
+
+        else:
+            raise ValueError(f"Unknown risk_type '{risk_type}'.")
+
+        return pT, info
+
+    # ============================================================
+    # 5. Backward adjoint (driver tipo GBM, mas com v_t em σ_t)
+    # ============================================================
+
+    def backward_adjoint(self, pT):
+        S_path    = self.S_path
+        v_path    = self.v_path
+        dW        = self.dW
+        d2H_dt_dS = self.d2H_dt_dS
+        d2H_dSS   = self.d2H_dSS
+        d3H_dS3   = self.d3H_dS3
+        dt = self.dt
+
+        M, steps = S_path.shape
+        p = np.zeros((M, steps))
+        q = np.zeros((M, steps-1))
+        p[:, -1] = pT
+
+        for n in reversed(range(steps-1)):
+            Sn = S_path[:, n]
+            vn = np.maximum(v_path[:, n], 1e-8)
+            sigma_n = np.sqrt(vn)
+            dWn = dW[:, n]
+
+            d2H_dt_dS_n = 100.0 * d2H_dt_dS[:, n]
+            d2H_dSS_n   = d2H_dSS[:, n]
+            d3H_dS3_n   = d3H_dS3[:, n]
+
+            A_n = d2H_dt_dS_n + 0.5 * (sigma_n**2) * (
+                2.0 * Sn * d2H_dSS_n + (Sn**2) * d3H_dS3_n
+            )
+
             p_next = p[:, n+1]
+            p_n = p_next - A_n * p_next * dt
+            p[:, n] = p_n
 
-            f_val = f_func(t_next, S_next, v_next, L_next, p_next)
-            Y = p_next + f_val * dt
+            denom = dWn.copy()
+            denom[np.abs(denom) < 1e-8] = 1e-8
+            q[:, n] = (p_next - p_n - A_n * p_n * dt) / denom
 
-            # Basis for Monte Carlo regression [1, S_n, v_n, L_n]
-            X = np.column_stack((np.ones(M), S[:, n], v[:, n], L[:, n]))
-            coeffs, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-            p[:, n] = coeffs[0] + coeffs[1] * S[:, n] + coeffs[2] * v[:, n] + coeffs[3] * L[:, n]
+        return p, q
 
-        # === Step 3: Estimate q_n and r_n via martingale representation ===
-        for n in range(N-1):
-            delta_p = p[:, n+1] - p[:, n]
-            q[:, n] = np.mean(delta_p * dW1[:, n]) / dt  # noise from dW^S
-            r[:, n] = np.mean(delta_p * dW2[:, n]) / dt  # noise from dW^v
+    # ============================================================
+    # 6. Gradient (aqui entra o ∂_h H correto do Heston sem q^ν)
+    # ============================================================
 
-        # set terminal values to 0
-        q[:, -1] = 0.0
-        r[:, -1] = 0.0
-
-        # === Store results ===
-        self.p = p
-        self.q = q
-        self.r = r
-        return p, q, r
-
-    
-    def update_control(self, eps=1e-4, max_iter=50) -> np.ndarray:
+    def compute_gradient(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
         """
-        Control Update and Convergence Criterion for the Heston model.
-
-        Parameters
-        ----------
-        eps : float
-            Convergence tolerance for ||h^{(k+1)} - h^{(k)}||.
-        max_iter : int
-            Maximum number of iterations.
-
-        Returns
-        -------
-        h_opt : ndarray (M, N)
-            Optimal control h_t^* after convergence.
+        G_n ≈ (μ S_n + κ(θ - v_n)) p_n + sqrt(v_n) S_n q_n.
+        (termo em σ_v sqrt(v_n) q^ν é ignorado porque o código
+        não tem o segundo componente de q.)
         """
+        S_path = self.S_path
+        v_path = self.v_path
+        mu = self.mu
+        kappa = self.kappa
+        theta = self.theta
 
-        M, N = self.S_path.shape
-        dH_dS = self.dH_dS
-        S = self.S_path
-        v = self.v_path        # ⬅️ needed for Heston
-        p = self.p
-        q = self.q
-        r = getattr(self, "r", np.zeros((M, N)))  # ⬅️ optional r term
+        M, steps = S_path.shape
+        assert p.shape == (M, steps)
+        assert q.shape == (M, steps - 1)
 
-        # === Initialize hedge with the classical delta ===
-        h_old = np.copy(dH_dS)
+        S_trunc = S_path[:, :-1]
+        v_trunc = v_path[:, :-1]
+        sqrt_v  = np.sqrt(np.maximum(v_trunc, 1e-8))
 
-        # === Phi: correction term for Heston based on adjoints ===
-        def Phi(Sn, vn, pn, qn, rn):
-            """
-            Correction term Phi(S, v, p, q, r) based on adjoints for the Heston model.
-            For Heston, optimality condition: 
-                h* = ∂H/∂S + (μ / (v S)) * p
-            """
-            return (self.mu / (vn * Sn)) * pn   # ⬅️ modified denominator
+        G = (mu * S_trunc + kappa * (theta - v_trunc)) * p[:, :-1] \
+            + sqrt_v * S_trunc * q
+        return G
 
-        # === Fixed-point iteration for control update ===
+    # ============================================================
+    # 7. Control update
+    # ============================================================
+
+    @staticmethod
+    def update_control(
+        h: np.ndarray,
+        G: np.ndarray,
+        alpha: float,
+        max_G: float = 0.1,
+    ) -> np.ndarray:
+        assert h.shape == G.shape
+        G_clipped = np.clip(G, -max_G, max_G)
+        return h - alpha * G_clipped
+
+    # ============================================================
+    # 8. Main optimization loop
+    # ============================================================
+
+    def optimize_hedge(self,
+                       risk_type: str,
+                       risk_kwargs: Dict,
+                       max_iter: int = 50,
+                       tol: float = 1e-4,
+                       alpha: float = 1e-3,
+                       verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+
+        h = self.init_control(kind="delta")
+        history: List[Dict] = []
+
         for k in range(max_iter):
-            h_new = np.zeros_like(h_old)
+            L = self.forward_PL(h, L0=0.0)
+            LT = L[:, -1]
 
-            for n in range(N):
-                for m in range(M):
-                    Sn = S[m, n]
-                    vn = v[m, n]
-                    pn = p[m, n]
-                    qn = q[m, n-1] if n > 0 else 0
-                    rn = r[m, n-1] if n > 0 else 0
-                    h_new[m, n] = dH_dS[m, n] + Phi(Sn, vn, pn, qn, rn)
+            rho = self.risk_function(LT, risk_type, **risk_kwargs)
+            pT, info = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
+            p, q = self.backward_adjoint(pT)
 
-            # === Check convergence criterion ===
-            diff = np.max(np.abs(h_new - h_old))
-            if diff < eps:
-                print(f"[OK] Convergence achieved in {k+1} iterations (diff={diff:.2e})")
-                self.h_opt = h_new
-                return h_new
+            G = self.compute_gradient(p, q)
+            grad_norm = np.mean(G**2)
 
-            # Update for the next iteration
-            h_old = h_new.copy()
+            history.append({"iter": k, "rho": rho, "grad_norm": grad_norm})
 
-        print("[Warning] Control update reached max_iter without full convergence.")
-        self.h_opt = h_new
-        return h_new
+            if verbose:
+                print(f"iter {k:3d} | rho={rho:.6f} | grad_norm={grad_norm:.6e}")
 
+            if grad_norm < tol:
+                break
 
-    
-    def update_L(self) -> np.ndarray:
-        """
-        Forward simulation of the profit process L_t under the Heston model
-        using the optimal hedge h_opt.
+            h = self.update_control(h, G, alpha)
 
-        The dynamics follow:
-            dL_t = b_t^Heston dt + η1_t^Heston dW_t^S + η2_t^Heston dW_t^v,
-
-        Parameters
-        ----------
-        None (uses self.h_opt and stored paths)
-
-        Returns
-        -------
-        L_opt : ndarray (M, N)
-            Simulated profit process under the optimal hedge.
-        """
-        # === Retrieve simulated quantities ===
-        M, N = self.S_path.shape
-        h_opt = self.h_opt
-        S_n = self.S_path[:, :-1]
-        v_n = self.v_path[:, :-1]
-        dH_S = self.dH_dS[:, :-1]
-        d2H_SS = self.d2H_dSS[:, :-1]
-        dH_v = self.dH_dv[:, :-1]
-        d2H_vv = self.d2H_dvv[:, :-1]
-        d2H_Sv = self.d2H_dSv[:, :-1]
-        dH_t = self.dH_dt[:, :-1]
-        dW1 = self.dW1
-        dW2 = self.dW2
-
-        # === Drift term b_t^Heston ===
-        b_n = (
-            h_opt[:, :-1] * self.mu * S_n
-            - (dH_t
-            + self.mu * S_n * dH_S
-            + self.kappa * (self.theta - v_n) * dH_v
-            + 0.5 * v_n * S_n**2 * d2H_SS
-            + 0.5 * (self.sigma_v**2) * v_n * d2H_vv
-            + self.rho * self.sigma_v * v_n * S_n * d2H_Sv)
-        )
-
-        # === Diffusion terms ===
-        eta1_n = (h_opt[:, :-1] - dH_S) * np.sqrt(v_n) * S_n
-        eta2_n = (h_opt[:, :-1] - dH_v) * self.sigma_v * np.sqrt(v_n)
-
-        # === Increments of L_t ===
-        dL = b_n * self.dt + eta1_n * dW1 + eta2_n * dW2
-
-        # === Build cumulative profit process ===
-        L_opt = np.zeros((M, N))
-        L_opt[:, 1:] = np.cumsum(dL, axis=1)
-
-        # === Store and return ===
-        self.L_opt = L_opt
-        return L_opt
+        return h, history
