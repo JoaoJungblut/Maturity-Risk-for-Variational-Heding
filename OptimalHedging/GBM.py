@@ -558,8 +558,8 @@ class GBMSimulator(BaseSimulator):
             if beta is None:
                 raise ValueError("Parameter 'beta' is required for risk_type='esl'.")
             LT = -LT
-            VaR = np.quantile(LT, beta)
-            rho = VaR + (1.0 / (1.0 - beta)) * np.mean(np.maximum(LT - VaR, 0.0))
+            alpha = np.quantile(LT, beta)
+            rho = alpha + (1.0 / (1.0 - beta)) * np.mean(np.maximum(LT - alpha, 0.0))
 
         else:
             raise ValueError(f"Unknown risk_type '{risk_type}'.")
