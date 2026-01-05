@@ -62,6 +62,7 @@ class BaseSimulator(ABC):
         self.N = N
         self.M = M
         self.dt = (T - t0) / N
+        self.steps = int(np.round((T - t0) / self.dt))
 
         self.seed = seed
         if seed is not None:
@@ -79,7 +80,7 @@ class BaseSimulator(ABC):
 
         Returns
         -------
-        S_path : ndarray, shape (M, steps)
+        S : ndarray, shape (M, steps)
             Simulated underlying paths.
         """
         raise NotImplementedError

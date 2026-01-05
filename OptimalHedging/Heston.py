@@ -56,12 +56,10 @@ class HestonSimulator(BaseSimulator):
         Returns
         -------
         S : ndarray, shape (M, steps)
-            Simulated Heston asset price paths.
+            Simulated Heston underlying asset price paths.
         v: ndarray, shape (M, steps)
-            Simulated Heston stochastic variance.    
+            Simulated Heston underlying asset stochastic variance.    
         """
-        steps = int(np.round((self.T - self.t0) / self.dt))
-
         # 2x2 correlation (covariance) matrix for (dW1, dW2)
         Sigma = np.array([
             [1.0,       self.corr],
@@ -73,14 +71,14 @@ class HestonSimulator(BaseSimulator):
         dW = np.random.multivariate_normal(
             mean=np.zeros(2),
             cov=Sigma * self.dt,
-            size=(self.M, steps - 1)
+            size=(self.M, self.steps - 1)
         )
 
         dW1 = dW[:, :, 0]  # (M, steps-1): Brownian increments driving S
         dW2 = dW[:, :, 1]  # (M, steps-1): Brownian increments driving v
 
-        S = np.zeros((self.M, steps))
-        v = np.zeros((self.M, steps))
+        S = np.zeros((self.M, self.steps))
+        v = np.zeros((self.M, self.steps))
 
         S[:, 0] = self.S0
         v[:, 0] = self.sigma
@@ -88,7 +86,7 @@ class HestonSimulator(BaseSimulator):
         eps = 1e-8  # floor to keep variance non-negative numerically
 
         # time loop only (vectorized across paths)
-        for n in range(steps - 1):
+        for n in range(self.steps - 1):
             Sn = S[:, n]
             vn = np.maximum(v[:, n], eps)
 

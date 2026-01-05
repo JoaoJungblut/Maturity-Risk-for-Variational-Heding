@@ -42,11 +42,9 @@ class JumpDiffusionSimulator(BaseSimulator):
         """
         Merton: dS = mu*S*dt + sigma*S*dW + S*(J-1)*dN.
         """
-        steps = int(np.round((self.T - self.t0) / self.dt))
-
-        dW = np.random.normal(0.0, np.sqrt(self.dt), size=(self.M, steps - 1))
-        dN = np.random.poisson(self.lam * self.dt, size=(self.M, steps - 1))
-        ZJ = np.random.normal(0.0, 1.0, size=(self.M, steps - 1))
+        dW = np.random.normal(0.0, np.sqrt(self.dt), size=(self.M, self.steps - 1))
+        dN = np.random.poisson(self.lam * self.dt, size=(self.M, self.steps - 1))
+        ZJ = np.random.normal(0.0, 1.0, size=(self.M, self.steps - 1))
         J  = np.exp(self.mJ + self.sJ * ZJ)
 
         factors = 1 + self.mu * self.dt + self.sigma * dW + (J - 1.0) * dN

@@ -1,6 +1,8 @@
 from OptimalHedging.Simulator import BaseSimulator
 import numpy as np
+from numpy.polynomial.chebyshev import Chebyshev
 from typing import Dict, List, Tuple
+import OptimalHedging.tools as tools
 
 
 class GBMSimulator(BaseSimulator):
@@ -19,7 +21,7 @@ class GBMSimulator(BaseSimulator):
         super().__init__(**base_kwargs)
 
     # ============================================================
-    # 0. Underlying S and derivative H (your original code)
+    # 0. Simulation of underlying asset S and derivative H 
     # ============================================================
 
     def simulate_S(self) -> np.ndarray:
@@ -31,20 +33,17 @@ class GBMSimulator(BaseSimulator):
         Returns
         -------
         S : ndarray, shape (M, steps)
-            Simulated GBM asset price paths.
+            Simulated GBM underlying asset price paths.
         """
-        steps = int(np.round((self.T - self.t0) / self.dt))
-        dW = np.random.normal(
-            loc=0.0,
-            scale=np.sqrt(self.dt),
-            size=(self.M, steps - 1)
-        )  # (M, steps-1)
+        dW = np.random.normal(loc=0.0,
+                              scale=np.sqrt(self.dt),
+                              size=(self.M, self.steps - 1))    # (M, steps-1)
 
         # multiplicative Euler step: S_{n+1} = S_n * (1 + mu*dt + sigma*dW)
         factors = 1 + self.mu * self.dt + self.sigma * dW
-        factors = np.hstack((np.ones((self.M, 1)), factors))  # insert initial factor = 1
-        S = self.S0 * np.cumprod(factors, axis=1)        # (M, steps)
-
+        factors = np.hstack((np.ones((self.M, 1)), factors))    # insert initial factor = 1
+        S = self.S0 * np.cumprod(factors, axis=1)               # (M, steps)
+        
         self.S_GBM = S
         self.dW_GBM = dW
 
@@ -208,18 +207,208 @@ class GBMSimulator(BaseSimulator):
         self.d3H_dS3 = d3H_dS3
 
         return H, dH_dS, d2H_dSS, dH_dt, d2H_dt_dS, d3H_dS3
+    
+
+    def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Estimate H(t,S) = E[(S_T - K)^+ | S_t = S] and derivatives using a single-pass 
+        LSMC (least-squares Monte Carlo) regression on the already-simulated paths.
+
+        Approach
+        --------
+        - Regress payoff Y = (S_T - K)^+ on a tensor Chebyshev basis in (t, x), where x = log(S) using ridge regularization.
+        - Compute derivatives analytically from the fitted basis in (t, x).
+        - Convert x-derivatives to S-derivatives via chain rule.
+
+        Returns
+        -------
+        H : ndarray, shape (M, steps)
+            Simulated contigent claim price path.
+        dH_dS : ndarray, shape (M, steps)
+            First-order derivative against underlying asset.
+        d2H_dSS : ndarray, shape (M, steps)
+            Second-order derivative against underlying asset. 
+        dH_dt : ndarray, shape (M, steps)
+            First-order derivative against time-step.
+        d2H_dt_dS : ndarray, shape (M, steps)
+            Second-order derivative against time-step and underlying asset.
+        d3H_dS3 : ndarray, shape (M, steps)
+            Third-order derivative against underlying asset.
+        """
+
+        if getattr(self, "S_GBM", None) is None:
+            raise ValueError("self.S_GBM is None. Run simulate_S() first.")
+
+        # ----------------------------
+        # Hyperparameters (tunable)
+        # ----------------------------
+        p_t = 1              # Chebyshev degree in time
+        p_x = 2              # Chebyshev degree in x = log(S)
+        lam_ridge = 1e-2     # ridge regularization (increase if derivatives are noisy)
+
+        # ----------------------------
+        # 1) Targets and state
+        # ----------------------------
+        # payoff per path (same target used across all times for that path)
+        Y = np.maximum(self.S_GBM[:, -1] - self.K, 0.0) 
+
+        # x = log(S) (work in x for numerical stability)
+        X_path = np.log(np.maximum(self.S_GBM, 1e-300))                             # (M, self.steps)
+
+        # time grid
+        t_grid = self.t0 + self.dt * np.arange(self.steps)                          # (self.steps, )
+
+        # ----------------------------
+        # 2) Scale (t, x) to [-1, 1]
+        # ----------------------------
+        x_min = float(X_path.min())
+        x_max = float(X_path.max())
+        if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+            raise ValueError("Invalid X_path range for scaling.")
+
+        zt = tools._minmax_scale(t_grid, self.t0, self.T)                           # (self.steps, )
+        zx = tools._minmax_scale(X_path.reshape(-1), x_min, x_max)                  # (M*self.steps, )
+
+        # scaling factors for derivatives:
+        # z = a*u + b => dz/du = a
+        dz_dt = 2.0 / (self.T - self.t0)
+        dz_dx = 2.0 / (x_max - x_min)
+
+        # ----------------------------
+        # 3) Chebyshev basis and derivatives in (t, zt) and (x, zx)
+        # ----------------------------
+        # time basis: (N_time, p_t+1)
+        Tt = tools._cheb_eval_all(zt, p_t, deriv=0)
+        dTt_dz = tools._cheb_eval_all(zt, p_t, deriv=1)
+        dTt_dt = dTt_dz * dz_dt                                                    # chain rule
+
+        # x basis on all observations (flattened): (M*N_time, p_x+1)
+        Tx = tools._cheb_eval_all(zx, p_x, deriv=0)
+        dTx_dz = tools._cheb_eval_all(zx, p_x, deriv=1)
+        d2Tx_dz2 = tools._cheb_eval_all(zx, p_x, deriv=2)
+        d3Tx_dz3 = tools._cheb_eval_all(zx, p_x, deriv=3)
+
+        # convert z-derivatives to x-derivatives (x = log S):
+        dTx_dx   = dTx_dz   * (dz_dx)
+        d2Tx_dx2 = d2Tx_dz2 * (dz_dx ** 2)
+        d3Tx_dx3 = d3Tx_dz3 * (dz_dx ** 3)
+
+        # ----------------------------
+        # 4) Build design matrix Phi for tensor basis in (t, x)
+        #    Phi row corresponds to one observation (m,n).
+        # ----------------------------
+        N_obs = self.M * self.steps
+        P = (p_t + 1) * (p_x + 1)
+        Phi = np.empty((N_obs, P), dtype=float)
+
+        # Repeat time basis rows M times to align with flattened X_path ordering
+        # Flatten convention used above: X_path.reshape(-1) is row-major -> time index changes fastest.
+        # That means order is: (m=0,n=0..), (m=1,n=0..), ...
+        # So time basis for each m is the same t_grid, repeated per path.
+        col = 0
+        for i in range(p_t + 1):
+            tt_rep = np.tile(Tt[:, i], self.M)                                  # (N_obs, )
+            for j in range(p_x + 1):
+                Phi[:, col] = tt_rep * Tx[:, j]
+                col += 1
+
+        # Targets replicated per time within each path:
+        y = np.repeat(Y, self.steps)                                            # (N_obs, )
+
+        # ----------------------------
+        # 5) Fit ridge regression
+        # ----------------------------
+        beta = tools._ridge_solve(Phi, y, lam=lam_ridge)                        # (P, )
+
+        # reshape coefficients into (p_t+1, p_x+1) for clearer evaluation
+        B = beta.reshape(p_t + 1, p_x + 1)
+
+        # ----------------------------
+        # 6) Evaluate H and derivatives in (t, x)
+        # ----------------------------
+        # We evaluate on the same observation grid (m,n) using flattened arrays for x-basis,
+        # then reshape back to (M, N_time).
+        H_flat    = np.zeros(N_obs, dtype=float)
+        Ht_flat   = np.zeros(N_obs, dtype=float)
+        Hx_flat   = np.zeros(N_obs, dtype=float)
+        Hxx_flat  = np.zeros(N_obs, dtype=float)
+        Hxxx_flat = np.zeros(N_obs, dtype=float)
+        Htx_flat  = np.zeros(N_obs, dtype=float)
+
+        for i in range(p_t + 1):
+            tt0 = np.tile(Tt[:, i], self.M)                                      # (N_obs, )
+            tt1 = np.tile(dTt_dt[:, i], self.M)                                  # (N_obs, )
+            for j in range(p_x + 1):
+                Bij = B[i, j]
+                if Bij == 0.0:
+                    continue
+                base = tt0 * Tx[:, j]
+                H_flat += Bij * base
+
+                # time derivative
+                Ht_flat += Bij * (tt1 * Tx[:, j])
+
+                # x-derivatives
+                Hx_flat   += Bij * (tt0 * dTx_dx[:, j])
+                Hxx_flat  += Bij * (tt0 * d2Tx_dx2[:, j])
+                Hxxx_flat += Bij * (tt0 * d3Tx_dx3[:, j])
+
+                # mixed derivative (t,x)
+                Htx_flat  += Bij * (tt1 * dTx_dx[:, j])
+
+        H = H_flat.reshape(self.M, self.steps)
+        H = np.maximum(H, 0)
+        H_t = Ht_flat.reshape(self.M, self.steps)
+        H_x = Hx_flat.reshape(self.M, self.steps)
+        H_xx = Hxx_flat.reshape(self.M, self.steps)
+        H_xxx = Hxxx_flat.reshape(self.M, self.steps)
+        H_tx = Htx_flat.reshape(self.M, self.steps)
+
+        # ----------------------------
+        # 7) Convert x=log(S) derivatives to S-derivatives
+        # ----------------------------
+        S = np.maximum(self.S_GBM, 1e-300)
+        dH_dS = (1.0 / S) * H_x
+        d2H_dSS = (1.0 / (S ** 2)) * (H_xx - H_x)
+        d3H_dS3 = (1.0 / (S ** 3)) * (H_xxx - 3.0 * H_xx + 2.0 * H_x)
+        dH_dt = H_t
+        d2H_dtdS = (1.0 / S) * H_tx
+
+        # ----------------------------
+        # 8) Store 
+        # ----------------------------
+        self.H_GBM = H
+        self.dH_dS_GBM = dH_dS
+        self.d2H_dSS_GBM = d2H_dSS
+        self.dH_dt_GBM = dH_dt
+        self.d2H_dtdS_GBM = d2H_dtdS
+        self.d3H_dS3_GBM = d3H_dS3
+
+        # Keep regression metadata if useful for debugging/reuse
+        self._H_fit_GBM = {
+            "p_t": p_t,
+            "p_x": p_x,
+            "lam_ridge": lam_ridge,
+            "x_min": x_min,
+            "x_max": x_max,
+            "beta": beta,
+        }
+
+        return H, dH_dS, d2H_dSS, dH_dt, d2H_dtdS, d3H_dS3
+
+
 
     # ============================================================
     # 1. Control initialization
     # ============================================================
 
-    def init_control(self, kind: str = "delta") -> np.ndarray:
+    def init_control(self, kind: str = "Delta") -> np.ndarray:
         """
         Initialize the control h.
 
         Parameters
         ----------
-        kind : {"delta", "zero"}
+        kind : {"Delta", "zero"}
             Initialization rule.
 
         Returns
@@ -227,30 +416,28 @@ class GBMSimulator(BaseSimulator):
         h : ndarray, shape (M, steps-1)
             Initial control on each time interval [t_n, t_{n+1}).
         """
-        S_path = self.S_path
-        dH_dS = self.dH_dS
-        M, steps = S_path.shape
-
-        if kind == "delta":
-            h0 = dH_dS[:, :-1].copy()
+        if kind == "Delta":
+            h0 = 0.7 * self.dH_dS_GBM[:, :-1].copy()                            # smooth initial guess
         elif kind == "zero":
-            h0 = np.zeros((M, steps - 1))
+            h0 = np.zeros((self.M, self.steps - 1))
         else:
             raise ValueError("Unknown control initialization kind")
 
         return h0
 
+
+
     # ============================================================
-    # 2. Forward P&L
+    # 2. Forward Profit and Loss
     # ============================================================
     
     def forward_PL(self, h: np.ndarray, L0: float = 0.0) -> np.ndarray:
         """
-        Simulate P&L L_t using portfolio value:
+        Vectorized Profit and Loss L_t using portfolio value:
 
             V_t^h = h_t S_t - H_t
-            ΔL_n = V_{n+1}^h - V_n^h
-                = h_n (S_{n+1} - S_n) - (H_{n+1} - H_n)
+            Delta L_n = V_{n+1}^h - V_n^h
+                      = h_n (S_{n+1} - S_n) - (H_{n+1} - H_n)
 
         Parameters
         ----------
@@ -262,23 +449,21 @@ class GBMSimulator(BaseSimulator):
         Returns
         -------
         L : ndarray, shape (M, steps)
-            P&L paths over time.
+            Profit and Loss paths over time.
         """
-        S_path = self.S_path   # (M, steps)
-        H      = self.H        # (M, steps)
+        assert h.shape == (self.M, self.steps - 1)
 
-        M, steps = S_path.shape
-        assert h.shape == (M, steps - 1)
-
-        L = np.zeros((M, steps))
+        L = np.zeros((self.M, self.steps))
         L[:, 0] = L0
 
-        for n in range(steps - 1):
-            dS = S_path[:, n + 1] - S_path[:, n]
-            dH = H[:, n + 1] - H[:, n]
+        # increments
+        dS = np.diff(self.S_GBM, axis=1)         
+        dH = np.diff(self.H_GBM, axis=1)          
+        dL = h * dS - dH
 
-            # incremental P&L: h_n * ΔS - ΔH
-            L[:, n + 1] = L[:, n] + h[:, n] * dS - dH
+        L = np.empty((self.M, self.steps), dtype=float)
+        L[:, 0] = L0
+        L[:, 1:] = L0 + np.cumsum(dL, axis=1)
 
         return L
 
@@ -290,83 +475,91 @@ class GBMSimulator(BaseSimulator):
     @staticmethod
     def risk_function(LT: np.ndarray, risk_type: str, **kwargs) -> float:
         """
-        Compute rho_u(L_T) for different risk specifications.
+        Compute the composed risk functional rho_u(L_T) from terminal Profit and Loss simulation.
 
-        risk_type in {"ele","elw","entl","ente","entw","es"}.
+        Parameters
+        ----------
+        LT : ndarray, shape (M,)
+            Terminal Profit and Loss samples L_T^h generated by a given hedging strategy.
+        risk_type : str
+            Type of composed risk measure to be evaluated. Supported values are:
+                - "ele"  : Expected loss with exponential utility
+                - "elw"  : Expected loss with Weibull-type utility
+                - "entl" : Entropic risk with linear utility
+                - "ente" : Entropic risk with exponential utility
+                - "entw" : Entropic risk with Weibull-type utility
+                - "esl"   : Expected shortfall linear utility
+        **kwargs :
+            Parameters required by the chosen risk_type:
+                - "a"     : risk aversion parameter (exponential utility)
+                - "k"     : shape parameter (Weibull utility)
+                - "gamma" : entropic risk aversion parameter
+                - "beta"  : confidence level for expected shortfall
+
+        Returns
+        -------
+        rho : float
+            Estimation of the composed risk functional rho_u(L_T).
         """
         LT = np.asarray(LT)
 
+        # ----------------------------
+        # ele
+        # ----------------------------
         if risk_type == "ele":
             a = kwargs.get("a")
             if a is None:
                 raise ValueError("Parameter 'a' is required for 'ele'.")
             rho = np.mean(np.exp(-a * LT))
 
+        # ----------------------------
+        # elw
+        # ----------------------------
         elif risk_type == "elw":
             k = kwargs.get("k")
             if k is None:
                 raise ValueError("Parameter 'k' is required for 'elw'.")
-            loss = -np.minimum(LT, 0.0)
-            rho = np.mean(np.exp(loss**k))
+            rho = np.mean(np.exp((-np.minimum(LT, 0.0))**k))
 
+        # ----------------------------
+        # entl
+        # ----------------------------
         elif risk_type == "entl":
             gamma = kwargs.get("gamma")
             if gamma is None:
                 raise ValueError("Parameter 'gamma' is required for 'entl'.")
-            w = np.exp(-gamma * LT)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
+            rho = (1.0 / gamma) * np.log(np.mean(np.exp(-gamma * LT)))
 
+        # ----------------------------
+        # ente
+        # ----------------------------
         elif risk_type == "ente":
             gamma = kwargs.get("gamma")
             a = kwargs.get("a")
             if gamma is None or a is None:
                 raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
-            v = np.exp(-a * LT)
-            w = np.exp(gamma * v)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
+            rho = (1.0 / gamma) * np.log(np.mean(np.exp(gamma * np.exp(-a * LT))))
 
+        # ----------------------------
+        # entw
+        # ----------------------------
         elif risk_type == "entw":
-            # Entropic with Weibull-type utility:
-            # v(X)   = exp( ( -min(X/scale, 0) )^k )
-            # rho(X) = (1/gamma) log E[ exp( gamma * v(X) ) ]
             gamma = kwargs.get("gamma")
             k     = kwargs.get("k")
-            scale = kwargs.get("scale", 20.0)  # internal scaling to stabilize numerics
             if gamma is None or k is None:
                 raise ValueError("Parameters 'gamma' and 'k' are required for risk_type='entw'.")
+            rho = (1.0 / gamma) * np.log(np.mean(np.exp(gamma * np.exp((-np.minimum(LT, 0.0))**k)) ))
 
-            # Scale the P&L to reduce loss magnitude inside exponentials
-            LT_scaled = LT / scale
-
-            # Loss = -min(LT_scaled, 0)  >= 0
-            loss = -np.minimum(LT_scaled, 0.0)
-
-            # Inner power: g = loss^k
-            g = loss**k
-            # Clip g to avoid huge exponents in exp(g)
-            g = np.clip(g, 0.0, 10.0)  # exp(10) ~ 2.2e4 -> still safe
-
-            # v = exp(g)
-            v = np.exp(g)
-
-            # Outer exponent: z = gamma * v
-            z = gamma * v
-            # Clip again before exp(z)
-            z = np.clip(z, -20.0, 20.0)  # exp(20) ~ 4.8e8 -> safe
-
-            w = np.exp(z)  # exp(gamma * v)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
-
-
-        elif risk_type == "es":
+        # ----------------------------
+        # esl
+        # ----------------------------
+        elif risk_type == "esl":
             beta = kwargs.get("beta")
             if beta is None:
-                raise ValueError("Parameter 'beta' is required for 'es'.")
-            alpha = kwargs.get("alpha")
-            if alpha is None:
-                alpha = np.quantile(LT, beta)
-            excess = np.maximum(LT - alpha, 0.0)
-            rho = alpha + (1.0 / (1.0 - beta)) * np.mean(excess)
+                raise ValueError("Parameter 'beta' is required for risk_type='esl'.")
+            LT = -LT
+            VaR = np.quantile(LT, beta)
+            rho = VaR + (1.0 / (1.0 - beta)) * np.mean(np.maximum(LT - VaR, 0.0))
 
         else:
             raise ValueError(f"Unknown risk_type '{risk_type}'.")
