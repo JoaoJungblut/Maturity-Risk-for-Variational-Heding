@@ -12,7 +12,7 @@ class BaseSimulator(ABC):
       - Define the interface for:
           * underlying simulation (S)
           * derivative pricing/greeks (H, dH/dS, ...)
-          * P&L dynamics
+          * PandL dynamics
           * adjoint BSDE (p, q)
           * optimality condition and control update
           * main optimization loop
@@ -61,33 +61,12 @@ class BaseSimulator(ABC):
         self.T = T
         self.N = N
         self.M = M
-
-        self.seed = seed
-
-        # time step
         self.dt = (T - t0) / N
 
+        self.seed = seed
         if seed is not None:
             np.random.seed(seed)
 
-        # placeholders to be filled by subclasses
-        self.S_path: np.ndarray | None = None
-        self.dW: np.ndarray | None = None
-
-        self.S_grid: np.ndarray | None = None
-        self.H_grid: np.ndarray | None = None
-        self.Delta_grid: np.ndarray | None = None
-        self.Gamma_grid: np.ndarray | None = None
-        self.dHdt_grid: np.ndarray | None = None
-        self.d2H_dt_dS_grid: np.ndarray | None = None
-        self.d3H_dS3_grid: np.ndarray | None = None
-
-        self.H: np.ndarray | None = None
-        self.dH_dS: np.ndarray | None = None
-        self.d2H_dSS: np.ndarray | None = None
-        self.dH_dt: np.ndarray | None = None
-        self.d2H_dt_dS: np.ndarray | None = None
-        self.d3H_dS3: np.ndarray | None = None
 
     # ============================================================
     # 0. Underlying S and derivative H

@@ -8,6 +8,16 @@ class GBMSimulator(BaseSimulator):
     Simulator for Geometric Brownian Motion (GBM) + optimal hedging machinery.
     """
 
+    def __init__(self, 
+                 **base_kwargs):
+        """
+        Initialize the GBM simulator.
+
+        This class does not introduce new parameters and simply forwards
+        all arguments to the BaseSimulator initializer.
+        """
+        super().__init__(**base_kwargs)
+
     # ============================================================
     # 0. Underlying S and derivative H (your original code)
     # ============================================================
@@ -33,12 +43,12 @@ class GBMSimulator(BaseSimulator):
         # multiplicative Euler step: S_{n+1} = S_n * (1 + mu*dt + sigma*dW)
         factors = 1 + self.mu * self.dt + self.sigma * dW
         factors = np.hstack((np.ones((self.M, 1)), factors))  # insert initial factor = 1
-        S_path = self.S0 * np.cumprod(factors, axis=1)        # (M, steps)
+        S = self.S0 * np.cumprod(factors, axis=1)        # (M, steps)
 
-        self.S_path = S_path
-        self.dW = dW
+        self.S_GBM = S
+        self.dW_GBM = dW
 
-        return S_path
+        return S
 
     def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
                                   np.ndarray, np.ndarray, np.ndarray]:

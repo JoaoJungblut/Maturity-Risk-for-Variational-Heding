@@ -8,17 +8,31 @@ class JumpDiffusionSimulator(BaseSimulator):
     Merton Jump Diffusion + máquina de hedge.
     """
 
-    def __init__(
-        self,
-        lam: float,
-        mJ: float,
-        sJ: float,
-        **base_kwargs,
-    ):
+    def __init__(self,
+                 lam: float,
+                 meanJ: float,
+                 stdJ: float,
+                 **base_kwargs):
+        """
+        Initialize the jump-diffusion simulator.
+
+        Parameters
+        ----------
+        lam : float
+            Jump intensity (Poisson rate).
+        meanJ : float
+            Mean of jump size distribution.
+        stdJ : float
+            Standard deviation of jump size distribution.
+        base_kwargs : dict
+            Same arguments as BaseSimulator/GBMSimulator.
+        """
         super().__init__(**base_kwargs)
-        self.lam = float(lam)
-        self.mJ  = float(mJ)
-        self.sJ  = float(sJ)
+
+        self.lam = lam
+        self.meanJ = meanJ
+        self.stdJ = stdJ
+
 
     # ============================================================
     # 0. Underlying S and derivative H
@@ -29,24 +43,23 @@ class JumpDiffusionSimulator(BaseSimulator):
         Merton: dS = mu*S*dt + sigma*S*dW + S*(J-1)*dN.
         """
         steps = int(np.round((self.T - self.t0) / self.dt))
-        M = self.M
-        dt = self.dt
 
-        dW = np.random.normal(0.0, np.sqrt(dt), size=(M, steps - 1))
-        dN = np.random.poisson(self.lam * dt, size=(M, steps - 1))
-        ZJ = np.random.normal(0.0, 1.0, size=(M, steps - 1))
+        dW = np.random.normal(0.0, np.sqrt(self.dt), size=(self.M, steps - 1))
+        dN = np.random.poisson(self.lam * self.dt, size=(self.M, steps - 1))
+        ZJ = np.random.normal(0.0, 1.0, size=(self.M, steps - 1))
         J  = np.exp(self.mJ + self.sJ * ZJ)
 
-        factors = 1 + self.mu * dt + self.sigma * dW + (J - 1.0) * dN
-        factors = np.hstack((np.ones((M, 1)), factors))
-        S_path = self.S0 * np.cumprod(factors, axis=1)
+        factors = 1 + self.mu * self.dt + self.sigma * dW + (J - 1.0) * dN
+        factors = np.hstack((np.ones((self.M, 1)), factors))
+        S = self.S0 * np.cumprod(factors, axis=1)
 
-        self.S_path = S_path
-        self.dW = dW
-        self.dN = dN
-        self.J  = J
+        self.S_Jump = S
+        self.dW_Jump = dW
+        self.dN_Jump = dN
+        self.ZJ_Jump = ZJ
+        self.J_Jump  = J
 
-        return S_path
+        return S, J
 
     def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
                                   np.ndarray, np.ndarray, np.ndarray]:

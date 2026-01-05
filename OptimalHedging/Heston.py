@@ -9,25 +9,36 @@ class HestonSimulator(BaseSimulator):
     mas com gradiente ∂_h H próprio do modelo.
     """
 
-    def __init__(
-        self,
-        kappa: float,
-        theta: float,
-        sigma_v: float,
-        rho: float,
-        v0: float,
-        **base_kwargs,
-    ):
+    def __init__(self,
+                 kappa: float,
+                 theta: float,
+                 sigma_v: float,
+                 corr: float,
+                 **base_kwargs):
         """
-        base_kwargs = mesmos argumentos do GBMSimulator/BaseSimulator:
-            M, S0, K, mu, sigma (pode ser usado só como ref), t0, T, dt, etc.
+        Initialize the Heston simulator.
+
+        Parameters
+        ----------
+        kappa : float
+            Mean-reversion speed of the variance process.
+        theta : float
+            Long-run mean of the variance process.
+        sigma_v : float
+            Volatility of variance (vol-of-vol).
+        corr : float
+            Correlation between dW1 (asset) and dW2 (variance).
+        base_kwargs : dict
+            Same arguments as BaseSimulator/GBMSimulator:
+            S0, mu, sigma, K, t0, T, N, M, seed.
         """
         super().__init__(**base_kwargs)
-        self.kappa = float(kappa)
-        self.theta = float(theta)
-        self.sigma_v = float(sigma_v)
-        self.rho   = float(rho)
-        self.v0    = float(v0)
+
+        self.kappa = kappa
+        self.theta = theta
+        self.sigma_v = sigma_v
+        self.corr = corr
+
 
     # ============================================================
     # 0. Underlying S,v and derivative H
@@ -35,47 +46,66 @@ class HestonSimulator(BaseSimulator):
 
     def simulate_S(self) -> np.ndarray:
         """
-        Heston Euler:
+        Simulate Heston model paths using a vectorized (over paths) Euler–Maruyama scheme.
 
             dS = mu * S * dt + sqrt(v) * S * dW1
-            dv = kappa*(theta - v)*dt + sigma_v*sqrt(v)*dW2,
+            dv = kappa*(theta - v)*dt + sigma_v*sqrt(v)*dW2
 
-        corr(dW1,dW2) = rho.
+        with corr(dW1, dW2) = corr.
+
+        Returns
+        -------
+        S : ndarray, shape (M, steps)
+            Simulated Heston asset price paths.
+        v: ndarray, shape (M, steps)
+            Simulated Heston stochastic variance.    
         """
         steps = int(np.round((self.T - self.t0) / self.dt))
-        M = self.M
-        dt = self.dt
 
-        Z1 = np.random.normal(0.0, 1.0, size=(M, steps - 1))
-        Z2 = np.random.normal(0.0, 1.0, size=(M, steps - 1))
+        # 2x2 correlation (covariance) matrix for (dW1, dW2)
+        Sigma = np.array([
+            [1.0,       self.corr],
+            [self.corr, 1.0]
+        ])
 
-        dW1 = np.sqrt(dt) * Z1                # Browniano de S
-        dW2_ind = np.sqrt(dt) * Z2
-        dW2 = self.rho * dW1 + np.sqrt(1.0 - self.rho**2) * dW2_ind  # Browniano de v
+        # correlated Brownian increments: shape (M, steps-1, 2)
+        # each increment has covariance Sigma * dt
+        dW = np.random.multivariate_normal(
+            mean=np.zeros(2),
+            cov=Sigma * self.dt,
+            size=(self.M, steps - 1)
+        )
 
-        S = np.zeros((M, steps))
-        v = np.zeros((M, steps))
+        dW1 = dW[:, :, 0]  # (M, steps-1): Brownian increments driving S
+        dW2 = dW[:, :, 1]  # (M, steps-1): Brownian increments driving v
+
+        S = np.zeros((self.M, steps))
+        v = np.zeros((self.M, steps))
 
         S[:, 0] = self.S0
-        v[:, 0] = self.v0
+        v[:, 0] = self.sigma
 
+        eps = 1e-8  # floor to keep variance non-negative numerically
+
+        # time loop only (vectorized across paths)
         for n in range(steps - 1):
             Sn = S[:, n]
-            vn = np.maximum(v[:, n], 1e-8)
+            vn = np.maximum(v[:, n], eps)
 
-            S[:, n + 1] = Sn + self.mu * Sn * dt + np.sqrt(vn) * Sn * dW1[:, n]
-            v[:, n + 1] = (
-                vn
-                + self.kappa * (self.theta - vn) * dt
-                + self.sigma_v * np.sqrt(vn) * dW2[:, n]
-            )
-            v[:, n + 1] = np.maximum(v[:, n + 1], 1e-8)
+            # Euler step for S
+            S[:, n + 1] = Sn * (1.0 + self.mu * self.dt + np.sqrt(vn) * dW1[:, n])
 
-        self.S_path = S
-        self.v_path = v
-        self.dW = dW1  # para o adjunto, usamos o browniano de S
+            # Euler step for v (with truncation)
+            v_next = vn + self.kappa * (self.theta - vn) * self.dt + self.sigma_v * np.sqrt(vn) * dW2[:, n]
+            v[:, n + 1] = np.maximum(v_next, eps)
 
-        return S
+        self.S_Heston = S
+        self.v_Heston = v
+        self.dW1_Heston = dW1
+        self.dW2_Heston = dW2
+
+        return S, v
+ 
 
     def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
                                   np.ndarray, np.ndarray, np.ndarray]:
