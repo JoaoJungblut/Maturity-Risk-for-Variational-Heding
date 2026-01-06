@@ -716,21 +716,26 @@ class GBMSimulator(BaseSimulator):
     # ============================================================
     # 6. Gradient (optimality condition)
     # ============================================================
-
     def compute_gradient(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
         """
-        Compute G_n = μ S_n p_n + σ S_n q_n.
+        Compute the violation of the local optimality condition
+        (e.g. G_n = μ S_n p_n + σ S_n q_n for GBM).
+
+        Parameters
+        ----------
+        p : ndarray, shape (M, steps)
+        q : ndarray, shape (M, steps-1)
+
+        Returns
+        -------
+        G : ndarray, shape (M, steps-1)
+            Gradient-like quantity used to update the control.
         """
-        S_path = self.S_path
-        mu = self.mu
-        sigma = self.sigma
+        assert p.shape == (self.M, self.steps)
+        assert q.shape == (self.M, self.steps - 1)
 
-        M, steps = S_path.shape
-        assert p.shape == (M, steps)
-        assert q.shape == (M, steps - 1)
-
-        S_trunc = S_path[:, :-1]
-        G = mu * S_trunc * p[:, :-1] + sigma * S_trunc * q
+        S_trunc = self.S_GBM[:, :-1]
+        G = self.mu * S_trunc * p[:, :-1] + self.sigma * S_trunc * q
         return G
 
     # ============================================================
