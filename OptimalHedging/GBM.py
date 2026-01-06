@@ -248,7 +248,8 @@ class GBMSimulator(BaseSimulator):
     # 1. Control initialization
     # ============================================================
 
-    def init_control(self, kind: str = "Delta") -> np.ndarray:
+    def init_control(self, 
+                     kind: str = "Delta") -> np.ndarray:
         """
         Initialize the control h.
 
@@ -263,7 +264,7 @@ class GBMSimulator(BaseSimulator):
             Initial control on each time interval [t_n, t_{n+1}).
         """
         if kind == "Delta":
-            h0 = 0.7 * self.dH_dS_GBM[:, :-1].copy()                            # smooth initial guess
+            h0 = 1 * self.dH_dS_GBM[:, :-1].copy()                            # smooth initial guess
         elif kind == "zero":
             h0 = np.zeros((self.M, self.steps - 1))
         else:
@@ -276,21 +277,24 @@ class GBMSimulator(BaseSimulator):
     # ============================================================
     # 2. Forward Profit and Loss
     # ============================================================
-    
-    def forward_PL(self, h: np.ndarray, L0: float = 0.0) -> np.ndarray:
+    def forward_PL(self,
+                   h: np.ndarray,
+                   L0: float = 0.0,
+                   t_start: int = 0) -> np.ndarray:
         """
-        Vectorized Profit and Loss L_t using portfolio value:
+        Vectorized Profit and Loss L_t using portfolio value.
 
-            V_t^h = h_t S_t - H_t
-            Delta L_n = V_{n+1}^h - V_n^h
-                      = h_n (S_{n+1} - S_n) - (H_{n+1} - H_n)
+        If start_idx > 0, the P&L is forced to be zero for all times < start_idx,
+        so that L[:, -1] represents the residual P&L L_{t,T}.
 
         Parameters
         ----------
         h : ndarray, shape (M, steps-1)
             Hedge ratio on each interval [t_n, t_{n+1}).
         L0 : float, default=0.0
-            Initial P&L (relative).
+            Initial Profit and Loss level.
+        t_start : float, default=0
+            Time index t at which Profit and Loss accumulation starts.
 
         Returns
         -------
@@ -298,28 +302,35 @@ class GBMSimulator(BaseSimulator):
             Profit and Loss paths over time.
         """
         assert h.shape == (self.M, self.steps - 1)
+        assert self.t0 <= t_start <= self.T
+        start_idx = tools._time_to_index(N=self.N, t0=self.t0, T=self.T, t_start=t_start)
 
+
+        # increments occur at times 1,...,steps-1
+        dS = np.diff(self.S_GBM, axis=1)        # (M, steps-1)
+        dH = np.diff(self.H_GBM, axis=1)        # (M, steps-1)
+        dL = h * dS - dH                        # (M, steps-1)
+
+        # cumulative P&L
         L = np.zeros((self.M, self.steps))
-        L[:, 0] = L0
-
-        # increments
-        dS = np.diff(self.S_GBM, axis=1)         
-        dH = np.diff(self.H_GBM, axis=1)          
-        dL = h * dS - dH
-
-        L = np.empty((self.M, self.steps), dtype=float)
         L[:, 0] = L0
         L[:, 1:] = L0 + np.cumsum(dL, axis=1)
 
+        # cut past
+        if start_idx > 0:
+            L[:, :start_idx] = 0.0
+
         return L
+
 
 
     # ============================================================
     # 3. Risk functional
     # ============================================================
-
     @staticmethod
-    def risk_function(LT: np.ndarray, risk_type: str, **kwargs) -> float:
+    def risk_function(LT: np.ndarray, 
+                      risk_type: str, 
+                      **kwargs) -> float:
         """
         Compute the composed risk functional rho_u(L_T) from terminal Profit and Loss simulation.
 
@@ -418,7 +429,9 @@ class GBMSimulator(BaseSimulator):
     # 4. Terminal adjoint
     # ============================================================
     @staticmethod
-    def terminal_adjoint(LT: np.ndarray, risk_type: str, **kwargs) -> np.ndarray:
+    def terminal_adjoint(LT: np.ndarray, 
+                         risk_type: str, 
+                         **kwargs) -> np.ndarray:
         """
         Compute the terminal adjoint p_T = Upsilon(L_T) for the composed risk functional.
 
@@ -640,7 +653,9 @@ class GBMSimulator(BaseSimulator):
     # ============================================================
     # 6. Gradient (optimality condition)
     # ============================================================
-    def compute_gradient(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    def compute_gradient(self, 
+                         p: np.ndarray, 
+                         q: np.ndarray) -> np.ndarray:
         """
         Compute the violation of the local optimality condition
         (e.g. G_n = mu S_n p_n + sigma S_n q_n for GBM).
@@ -669,8 +684,7 @@ class GBMSimulator(BaseSimulator):
     # 7. Control update
     # ============================================================
     @staticmethod
-    def update_control(self,
-                       h: np.ndarray,
+    def update_control(h: np.ndarray,
                        G: np.ndarray,
                        alpha: float = 1,
                        eps: float = 1e-12) -> np.ndarray:
@@ -706,12 +720,13 @@ class GBMSimulator(BaseSimulator):
     # 8. Main optimization loop
     # ============================================================
     def optimize_hedge(self,
-                       risk_type: str,
-                       risk_kwargs: Dict,
-                       max_iter: int = 20,
-                       tol: float = 1e-4,
-                       alpha: float = 1e-3,
-                       verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+                    risk_type: str,
+                    risk_kwargs: Dict,
+                    t_idx: int = 0,
+                    max_iter: int = 20,
+                    tol: float = 1e-4,
+                    alpha: float = 1e-3,
+                    verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
         """
         Main optimization loop to compute an approximate optimal hedge h.
         - Keep the last two accepted controls: h_curr (best/current), h_prev (previous).
@@ -727,6 +742,8 @@ class GBMSimulator(BaseSimulator):
             One of {"ele", "elw", "entl", "ente", "entw", "es"}.
         risk_kwargs : dict
             Parameters required for the chosen risk_type.
+        t_idx : int, default=0
+            Time index t at which P&L accumulation starts.
         max_iter : int
             Maximum number of iterations.
         tol : float
@@ -754,14 +771,20 @@ class GBMSimulator(BaseSimulator):
 
         for k in range(max_iter):
             # ----- evaluate gradient norm at current accepted control -----
-            L = self.forward_PL(h_curr, L0=0.0)
+            L = self.forward_PL(h_curr, L0=0.0, t_start=t_idx)
             LT = L[:, -1]
             pT = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
             p, q = self.backward_adjoint(pT)
             G_curr = self.compute_gradient(p, q)
             g_curr = np.linalg.norm(G_curr) / np.sqrt(G_curr.size)
 
-            history.append({"iter": k, "phase": "base", "alpha": alpha, "grad_norm": g_curr, "accepted": True})
+            history.append({
+                "iter": k,
+                "phase": "base",
+                "alpha": alpha,
+                "grad_norm": g_curr,
+                "accepted": True
+            })
 
             if verbose:
                 print(f"iter {k:3d} | grad_norm={g_curr:.6e} | alpha={alpha:.2e}")
@@ -773,7 +796,7 @@ class GBMSimulator(BaseSimulator):
             alpha_try = alpha
             h_try = self.update_control(h_curr, G_curr, alpha_try)
 
-            L_try = self.forward_PL(h_try, L0=0.0)
+            L_try = self.forward_PL(h_try, L0=0.0, t_start=t_idx)
             LT_try = L_try[:, -1]
             pT_try = self.terminal_adjoint(LT_try, risk_type, **risk_kwargs)
             p_try, q_try = self.backward_adjoint(pT_try)
@@ -795,23 +818,21 @@ class GBMSimulator(BaseSimulator):
                 print(f"    trial    | alpha={alpha_try:.2e} | grad_norm={g_try:.6e} | {tag}")
 
             if first_accept:
-                # accept and move forward
                 h_prev = h_curr
                 h_curr = h_try
                 continue
 
-            # ----- ROLLBACK IMMEDIATELY on first rejection -----
-            if h_prev is None:
-                if verbose:
-                    print("rollback requested but no previous point available (stopping).")
-                break
-
-            # anchor becomes previous accepted; alpha is shrunk once immediately
-            anchor_h = h_prev
+            if k < 2:
+                if verbose: print("rollback disabled (k < 2)")
+                continue
+            
+            # ----- ROLLBACK / BACKTRACKING ANCHOR -----
+            # If no previous accepted control exists (e.g. k=0), anchor at current control (do not stop).
+            anchor_h = h_prev if (h_prev is not None) else h_curr
             alpha_try = alpha * shrink
 
             # recompute gradient at anchor (required)
-            L_a = self.forward_PL(anchor_h, L0=0.0)
+            L_a = self.forward_PL(anchor_h, L0=0.0, t_start=t_idx)
             LT_a = L_a[:, -1]
             pT_a = self.terminal_adjoint(LT_a, risk_type, **risk_kwargs)
             p_a, q_a = self.backward_adjoint(pT_a)
@@ -820,14 +841,15 @@ class GBMSimulator(BaseSimulator):
 
             history.append({
                 "iter": k,
-                "phase": "rollback_anchor",
+                "phase": "rollback_anchor" if (h_prev is not None) else "bt_anchor_curr",
                 "alpha": alpha_try,
                 "grad_norm": g_a,
                 "accepted": True
             })
 
             if verbose:
-                print(f"    rollback | anchor=prev | grad_norm={g_a:.6e} | alpha={alpha_try:.2e}")
+                anc = "prev" if (h_prev is not None) else "curr"
+                print(f"    rollback | anchor={anc} | grad_norm={g_a:.6e} | alpha={alpha_try:.2e}")
 
             accepted = False
             for j in range(bt_max):
@@ -836,7 +858,7 @@ class GBMSimulator(BaseSimulator):
 
                 h_new = self.update_control(anchor_h, G_a, alpha_try)
 
-                L_new = self.forward_PL(h_new, L0=0.0)
+                L_new = self.forward_PL(h_new, L0=0.0, t_start=t_idx)
                 LT_new = L_new[:, -1]
                 pT_new = self.terminal_adjoint(LT_new, risk_type, **risk_kwargs)
                 p_new, q_new = self.backward_adjoint(pT_new)
@@ -847,7 +869,7 @@ class GBMSimulator(BaseSimulator):
 
                 history.append({
                     "iter": k,
-                    "phase": "search_from_prev",
+                    "phase": "search_from_prev" if (h_prev is not None) else "search_from_curr",
                     "search_step": j,
                     "alpha": alpha_try,
                     "grad_norm": g_new,
@@ -860,7 +882,7 @@ class GBMSimulator(BaseSimulator):
 
                 if is_accept:
                     # accept: shift chain and set current alpha to the accepted one
-                    h_prev = anchor_h
+                    h_prev = anchor_h  # will be h_curr if we anchored at curr
                     h_curr = h_new
                     alpha = alpha_try
                     accepted = True
@@ -874,3 +896,88 @@ class GBMSimulator(BaseSimulator):
                 break
 
         return h_curr, history
+
+
+
+    # ============================================================
+    # 9. Maturity Risk computation
+    # ============================================================
+    def compute_MR(self,
+                   t_idx: int,
+                   risk_type: str,
+                   risk_kwargs: Dict,
+                   max_iter: int = 20,
+                   tol: float = 1e-4,
+                   alpha: float = 1e-3,
+                   verbose: bool = True) -> Tuple[float, Dict]:
+        """
+        Compute the maturity risk MR(t) via two optimal hedging problems.
+
+        The maturity risk is defined as the difference between:
+            - the optimal risk on the sub-horizon [t, T], and
+            - the optimal risk on the full horizon [0, T].
+
+            MR(t) = rho_t - rho_T
+
+        Parameters
+        ----------
+        t_idx : int
+            Time index t at which the maturity risk is evaluated.
+            Must satisfy 0 <= t_idx <= self.steps.
+        risk_type : str
+            Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
+        risk_kwargs : dict
+            Parameters required by the chosen risk functional.
+        max_iter : int, default=20
+            Maximum number of iterations in the hedge optimization.
+        tol : float, default=1e-4
+            Tolerance on the gradient norm (stopping criterion).
+        alpha : float, default=1e-3
+            Step size used in the control update.
+        verbose : bool, default=True
+            If True, prints optimization diagnostics.
+
+        Returns
+        -------
+        MR : float
+            Maturity risk at time index t_idx, defined as rho_t - rho_T.
+        info : dict
+            Dictionary containing:
+                - "h_T"   : optimal hedge on [0, T]
+                - "h_t"   : optimal hedge on [t, T]
+                - "rho_T" : optimal risk on [0, T]
+                - "rho_t" : optimal risk on [t, T]
+        """
+        assert 0 <= t_idx <= self.T
+
+        # --- full horizon [0, T] ---
+        h_T, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=self.T,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose,
+        )
+        L_T = self.forward_PL(h_T, L0=0.0, t_start=self.T)
+        rho_T = self.risk_function(L_T[:, -1], risk_type, **risk_kwargs)
+
+        # --- sub-horizon [t, T] ---
+        h_t, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=t_idx,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose
+        )
+        L_t = self.forward_PL(h_t, L0=0.0, t_start=t_idx)
+        rho_t = self.risk_function(L_t[:, -1], risk_type, **risk_kwargs)
+
+        MR = rho_t - rho_T
+
+        return MR, {"h_T": h_T, "h_t": h_t, "rho_T": rho_T, "rho_t": rho_t}
+
+    

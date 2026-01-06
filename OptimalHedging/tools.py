@@ -1,6 +1,12 @@
 import numpy as np
 from numpy.polynomial.chebyshev import Chebyshev
 
+def _time_to_index(N, t0, T, t_start):
+    assert t0 <= t_start <= T
+    dt = (T - t0) / N
+    return int(np.floor((t_start - t0) / dt))
+
+
 def _minmax_scale(u: np.ndarray, umin: float, umax: float) -> np.ndarray:
     """Affine map u in [umin, umax] -> z in [-1, 1]."""
     return 2.0 * (u - umin) / (umax - umin) - 1.0
