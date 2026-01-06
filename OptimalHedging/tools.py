@@ -24,3 +24,25 @@ def _ridge_solve(Phi: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
     A.flat[:: P + 1] += lam  # add lam to diagonal
     b = Phi.T @ y
     return np.linalg.solve(A, b)
+
+
+def _solve_smoothed(Phi: np.ndarray,
+                    y: np.ndarray,
+                    beta_next: np.ndarray,
+                    lam_ridge: float,
+                    lam_time: float) -> np.ndarray:
+    """
+    Solve smoothed ridge:
+        min ||Phi beta - y||^2
+            + lam_ridge ||beta||^2
+            + lam_time  ||beta - beta_next||^2
+    """
+    P = Phi.shape[1]
+
+    A = Phi.T @ Phi
+    A.flat[:: P + 1] += (lam_ridge + lam_time)
+
+    b = Phi.T @ y + lam_time * beta_next
+
+    return np.linalg.solve(A, b)
+
