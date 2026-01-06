@@ -1,6 +1,5 @@
 from OptimalHedging.Simulator import BaseSimulator
 import numpy as np
-from numpy.polynomial.chebyshev import Chebyshev
 from typing import Dict, List, Tuple
 import OptimalHedging.tools as tools
 
@@ -19,6 +18,8 @@ class GBMSimulator(BaseSimulator):
         all arguments to the BaseSimulator initializer.
         """
         super().__init__(**base_kwargs)
+
+
 
     # ============================================================
     # 0. Simulation of underlying asset S and derivative H 
@@ -49,167 +50,10 @@ class GBMSimulator(BaseSimulator):
 
         return S
 
-    def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-                                  np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Backward estimation of H_t and its derivatives on a space grid, using
-        nested Monte Carlo and finite differences.
-
-        Uses
-        ----
-        self.S_path : ndarray, shape (M, N_time)
-            Simulated GBM paths.
-
-        Produces (pathwise, via interpolation on the S_grid)
-        -----------------------------------------------
-        H        : (M, N_time)
-        dH_dS    : (M, N_time)
-        d2H_dSS  : (M, N_time)
-        dH_dt    : (M, N_time)
-        d2H_dt_dS: (M, N_time)
-        d3H_dS3  : (M, N_time)
-        """
-        S_path = self.S_path
-        M, N_time = S_path.shape
-        K_strike = self.K
-        mu = self.mu
-        sigma = self.sigma
-        dt = self.dt
-
-        # ------------------------------------------------------------
-        # 1) Build a space grid S_grid covering the simulated paths
-        # ------------------------------------------------------------
-        S_min = S_path.min()
-        S_max = S_path.max()
-        margin = 0.1 * (S_max - S_min)
-        S_min -= margin
-        S_max += margin
-
-        n_S_grid = 50    # number of space points (tunable)
-        n_inner = 200    # inner MC paths per (t_n, s_k) (tunable)
-
-        S_grid = np.linspace(S_min, S_max, n_S_grid)  # (n_S_grid,)
-
-        # Tables on the space grid:
-        H_grid = np.zeros((N_time, n_S_grid))
-        Delta_grid = np.zeros((N_time, n_S_grid))
-        Gamma_grid = np.zeros((N_time, n_S_grid))
-        dHdt_grid = np.zeros((N_time, n_S_grid))
-        d2H_dt_dS_grid = np.zeros((N_time, n_S_grid))
-        d3H_dS3_grid = np.zeros((N_time, n_S_grid))
-
-        # ------------------------------------------------------------
-        # 2) Terminal condition at T: H(T,s) = max(s - K, 0)
-        # ------------------------------------------------------------
-        H_grid[-1, :] = np.maximum(S_grid - K_strike, 0.0)
-
-        # ------------------------------------------------------------
-        # 3) Backward in time on the grid via nested Monte Carlo
-        # ------------------------------------------------------------
-        for n in reversed(range(N_time - 1)):  # n = N_time-2, ..., 0
-            for k, s0 in enumerate(S_grid):
-                # inner paths starting at S(t_n) = s0
-                S_inner = np.full(n_inner, s0, dtype=float)
-
-                # simulate from t_n to T using Euler–Maruyama
-                for j in range(n, N_time - 1):
-                    dW_inner = np.random.normal(0.0, np.sqrt(dt), size=n_inner)
-                    S_inner = S_inner + mu * S_inner * dt + sigma * S_inner * dW_inner
-
-                payoff_inner = np.maximum(S_inner - K_strike, 0.0)
-                H_grid[n, k] = payoff_inner.mean()
-
-        # ------------------------------------------------------------
-        # 4) Spatial derivatives via finite differences
-        # ------------------------------------------------------------
-        dS = S_grid[1] - S_grid[0]  # uniform grid
-
-        for n in range(N_time):
-            # First and second derivative in S (interior)
-            for k in range(1, n_S_grid - 1):
-                Delta_grid[n, k] = (H_grid[n, k + 1] - H_grid[n, k - 1]) / (2.0 * dS)
-                Gamma_grid[n, k] = (H_grid[n, k + 1] - 2.0 * H_grid[n, k] + H_grid[n, k - 1]) / (dS ** 2)
-
-            # simple boundary handling: copy neighbors
-            Delta_grid[n, 0] = Delta_grid[n, 1]
-            Delta_grid[n, -1] = Delta_grid[n, -2]
-            Gamma_grid[n, 0] = Gamma_grid[n, 1]
-            Gamma_grid[n, -1] = Gamma_grid[n, -2]
-
-            # Third derivative in S: derivative of Gamma_grid in S
-            for k in range(1, n_S_grid - 1):
-                d3H_dS3_grid[n, k] = (Gamma_grid[n, k + 1] - Gamma_grid[n, k - 1]) / (2.0 * dS)
-
-            d3H_dS3_grid[n, 0] = d3H_dS3_grid[n, 1]
-            d3H_dS3_grid[n, -1] = d3H_dS3_grid[n, -2]
-
-        # ------------------------------------------------------------
-        # 5) Time derivative via finite differences in t
-        # ------------------------------------------------------------
-        for n in range(1, N_time - 1):
-            dHdt_grid[n, :] = (H_grid[n + 1, :] - H_grid[n - 1, :]) / (2.0 * dt)
-
-        # forward difference at initial time
-        dHdt_grid[0, :] = (H_grid[1, :] - H_grid[0, :]) / dt
-        # backward difference at terminal time
-        dHdt_grid[-1, :] = (H_grid[-1, :] - H_grid[-2, :]) / dt
-
-        # ------------------------------------------------------------
-        # 6) Mixed derivative in t and S
-        # ------------------------------------------------------------
-        for n in range(N_time):
-            for k in range(1, n_S_grid - 1):
-                d2H_dt_dS_grid[n, k] = (dHdt_grid[n, k + 1] - dHdt_grid[n, k - 1]) / (2.0 * dS)
-
-            d2H_dt_dS_grid[n, 0] = d2H_dt_dS_grid[n, 1]
-            d2H_dt_dS_grid[n, -1] = d2H_dt_dS_grid[n, -2]
-
-        # ------------------------------------------------------------
-        # 7) Interpolate everything to the simulated paths S_path
-        # ------------------------------------------------------------
-        H = np.zeros((M, N_time))
-        dH_dS = np.zeros((M, N_time))
-        d2H_dSS = np.zeros((M, N_time))
-        dH_dt = np.zeros((M, N_time))
-        d2H_dt_dS = np.zeros((M, N_time))
-        d3H_dS3 = np.zeros((M, N_time))
-
-        for n in range(N_time):
-            S_n = S_path[:, n]  # (M,)
-
-            H[:, n] = np.interp(S_n, S_grid, H_grid[n, :])
-            dH_dS[:, n] = np.interp(S_n, S_grid, Delta_grid[n, :])
-            d2H_dSS[:, n] = np.interp(S_n, S_grid, Gamma_grid[n, :])
-            dH_dt[:, n] = np.interp(S_n, S_grid, dHdt_grid[n, :])
-            d2H_dt_dS[:, n] = np.interp(S_n, S_grid, d2H_dt_dS_grid[n, :])
-            d3H_dS3[:, n] = np.interp(S_n, S_grid, d3H_dS3_grid[n, :])
-
-        # ------------------------------------------------------------
-        # 8) Store everything on self
-        # ------------------------------------------------------------
-        self.S_grid = S_grid
-        self.H_grid = H_grid
-        self.Delta_grid = Delta_grid
-        self.Gamma_grid = Gamma_grid
-        self.dHdt_grid = dHdt_grid
-        self.d2H_dt_dS_grid = d2H_dt_dS_grid
-        self.d3H_dS3_grid = d3H_dS3_grid
-
-        # rescaling in time-derivatives (numerical stabilization)
-        dH_dt = dH_dt / 100.0
-        d2H_dt_dS = d2H_dt_dS / 100.0
-
-        self.H = H
-        self.dH_dS = dH_dS
-        self.d2H_dSS = d2H_dSS
-        self.dH_dt = dH_dt
-        self.d2H_dt_dS = d2H_dt_dS
-        self.d3H_dS3 = d3H_dS3
-
-        return H, dH_dS, d2H_dSS, dH_dt, d2H_dt_dS, d3H_dS3
-    
-
-    def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def simulate_H(self, 
+                   p_t : int = 1, 
+                   p_x : int = 2, 
+                   lam_ridge : int = 1e-2) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Estimate H(t,S) = E[(S_T - K)^+ | S_t = S] and derivatives using a single-pass 
         LSMC (least-squares Monte Carlo) regression on the already-simulated paths.
@@ -220,6 +64,15 @@ class GBMSimulator(BaseSimulator):
         - Compute derivatives analytically from the fitted basis in (t, x).
         - Convert x-derivatives to S-derivatives via chain rule.
 
+        Parameters
+        ----------
+        p_t : int, default=1
+            Chebyshev degree in time
+        p_x : int, default=2
+            Chebyshev degree in x = log(S)
+        lam_ridge: int, default=1e-2 
+            Ridge regularization
+        
         Returns
         -------
         H : ndarray, shape (M, steps)
@@ -238,13 +91,6 @@ class GBMSimulator(BaseSimulator):
 
         if getattr(self, "S_GBM", None) is None:
             raise ValueError("self.S_GBM is None. Run simulate_S() first.")
-
-        # ----------------------------
-        # Hyperparameters (tunable)
-        # ----------------------------
-        p_t = 1              # Chebyshev degree in time
-        p_x = 2              # Chebyshev degree in x = log(S)
-        lam_ridge = 1e-2     # ridge regularization (increase if derivatives are noisy)
 
         # ----------------------------
         # 1) Targets and state
@@ -686,13 +532,47 @@ class GBMSimulator(BaseSimulator):
                          pT: float,
                          p_x: int = 2,
                          lam_ridge: float = 1e-2,
-                         lam_time: float = 1e-1) -> tuple[np.ndarray, np.ndarray]:
+                         lam_time: float = 1e-2) -> tuple[np.ndarray, np.ndarray]:
         """
-        Backward adjoint BSDE solved step-by-step (one regression per time n),
-        with:
-        - regressor x = log(S)
-        - Chebyshev basis of degree p_x
-        - ridge regularization + intertemporal smoothing of coefficients
+        Solve the backward adjoint BSDE associated with the optimal hedging problem 
+        by a discrete-time backward scheme combined with regression.
+
+        Numerical scheme
+        ----------------
+        - Time is discretized on the same grid used for the forward simulation.
+        - The backward equation is solved iteratively for n = N-1, ..., 0.
+        - For each n:
+            * q_n is obtained from the martingale representation q_n = E[p_{n+1} Delta W_n | S_n] / Delta t.
+            * p_n is obtained from the drift part of the adjoint dynamics,
+            using a first-order Euler discretization that includes the
+            second- and third-order sensitivities of H(t,S).
+
+        Regression method
+        -----------------
+        - The conditional expectations are approximated using a Chebyshev polynomial
+        basis in the regressor x = log(S).
+        - A ridge-regularized least-squares fit is performed at each time step.
+        - Intertemporal smoothing of the regression coefficients is applied to
+        stabilize the backward propagation.
+
+        Parameters
+        ----------
+        pT : ndarray, shape (M,)
+            Terminal adjoint values p_T, obtained from the derivative of the
+            terminal risk functional with respect to the terminal P&L.
+        p_x : int, default=2
+            Degree of the Chebyshev polynomial basis used in the regression.
+        lam_ridge : float, default=1e-2
+            Ridge regularization parameter for the cross-sectional regressions.
+        lam_time : float, default=1e-2
+            Temporal smoothing parameter for regression coefficients across time.
+
+        Returns
+        -------
+        p : ndarray, shape (M, steps)
+            Backward adjoint process p_t along each simulated path.
+        q : ndarray, shape (M, steps-1)
+            Martingale component q_t of the adjoint process.
         """
         p = np.zeros((self.M, self.steps), dtype=float)
         q = np.zeros((self.M, self.steps - 1), dtype=float)
@@ -742,6 +622,15 @@ class GBMSimulator(BaseSimulator):
             beta_q_next = beta_q
             beta_p_next = beta_p
 
+        # Keep regression metadata if useful for debugging/reuse
+        self._backward_fit_GBM = {
+            "p_x": p_x,
+            "lam_ridge": lam_ridge,
+            "lam_time": lam_time,
+            "x_min": x_min,
+            "x_max": x_max,
+        }
+
         self.p_GBM = p
         self.q_GBM = q
         return p, q
@@ -754,7 +643,7 @@ class GBMSimulator(BaseSimulator):
     def compute_gradient(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
         """
         Compute the violation of the local optimality condition
-        (e.g. G_n = μ S_n p_n + σ S_n q_n for GBM).
+        (e.g. G_n = mu S_n p_n + sigma S_n q_n for GBM).
 
         Parameters
         ----------
