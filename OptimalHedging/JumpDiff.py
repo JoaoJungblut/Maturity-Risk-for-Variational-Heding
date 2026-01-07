@@ -1,11 +1,66 @@
 from OptimalHedging.Simulator import BaseSimulator
+import OptimalHedging.tools as tools
 import numpy as np
 from typing import Dict, List, Tuple
 
 
 class JumpDiffusionSimulator(BaseSimulator):
     """
-    Merton Jump Diffusion + máquina de hedge.
+    Simulator for Merton jump diffusion process with optimal hedging machinery.
+
+    This class implements all model dependent components required to solve the
+    optimal hedging problem under a jump diffusion dynamics. All methods below
+    are specific to the jump diffusion model and are therefore implemented
+    directly in this class. Only the terminal risk functional and the control
+    update rule are inherited from BaseSimulator.
+
+    Implemented methods
+    -------------------
+    - init :
+        Initializes the simulator and forwards all parameters to BaseSimulator.
+
+    - simulate_S :
+        Simulates jump diffusion paths for the underlying asset and stores the
+        asset paths together with the Brownian increments and jump information.
+
+    - simulate_H :
+        Computes the contingent claim price H t S and its time and space
+        derivatives using a single pass LSMC regression on a Chebyshev basis.
+
+    - init_control :
+        Initializes the hedging control typically using the delta of the
+        contingent claim as a smooth initial guess.
+
+    - forward_PL :
+        Simulates the forward profit and loss process associated with a given
+        hedging strategy under the jump diffusion dynamics.
+
+    - backward_adjoint :
+        Solves the backward adjoint equation associated with the jump diffusion
+        optimal hedging problem using regression based conditional expectations.
+
+    - compute_gradient :
+        Computes the jump diffusion specific optimality condition gradient used
+        to update the control process.
+
+    - optimize_hedge :
+        Runs the full iterative optimization loop to compute an approximate
+        optimal hedge under the chosen risk functional.
+
+    - compute_MR :
+        Computes the maturity risk by comparing optimal risks on sub horizons
+        and on the full time horizon.
+
+    Inherited from BaseSimulator
+    ----------------------------
+    - risk_function :
+        Evaluation of the terminal composed risk functional.
+
+    - terminal_adjoint :
+        Computation of the terminal adjoint associated with the risk functional.
+
+    - update_control :
+        Generic control update rule based on a normalized gradient step.
     """
 
     def __init__(self,
@@ -14,410 +69,399 @@ class JumpDiffusionSimulator(BaseSimulator):
                  stdJ: float,
                  **base_kwargs):
         """
-        Initialize the jump-diffusion simulator.
+        Initialize the jump diffusion simulator.
 
         Parameters
         ----------
         lam : float
-            Jump intensity (Poisson rate).
+            Jump intensity of the Poisson process.
         meanJ : float
-            Mean of jump size distribution.
+            Mean of the jump size distribution.
         stdJ : float
-            Standard deviation of jump size distribution.
+            Standard deviation of the jump size distribution.
         base_kwargs : dict
-            Same arguments as BaseSimulator/GBMSimulator.
+            Same arguments as BaseSimulator
+            S0 mu sigma K t0 T N M seed.
         """
         super().__init__(**base_kwargs)
 
-        self.lam = lam
-        self.meanJ = meanJ
-        self.stdJ = stdJ
+        self.lam = float(lam)
+        self.meanJ = float(meanJ)
+        self.stdJ = float(stdJ)
+
 
 
     # ============================================================
     # 0. Underlying S and derivative H
     # ============================================================
-
     def simulate_S(self) -> np.ndarray:
         """
-        Merton: dS = mu*S*dt + sigma*S*dW + S*(J-1)*dN.
-        """
-        dW = np.random.normal(0.0, np.sqrt(self.dt), size=(self.M, self.steps - 1))
-        dN = np.random.poisson(self.lam * self.dt, size=(self.M, self.steps - 1))
-        ZJ = np.random.normal(0.0, 1.0, size=(self.M, self.steps - 1))
-        J  = np.exp(self.mJ + self.sJ * ZJ)
+        Simulate Merton jump diffusion paths using a vectorized Euler scheme.
 
-        factors = 1 + self.mu * self.dt + self.sigma * dW + (J - 1.0) * dN
+            dS = mu * S * dt + sigma * S * dW + S * (J - 1) * dN
+
+        where dN is a Poisson process with intensity lam and J denotes the
+        random jump size.
+
+        Returns
+        -------
+        S : ndarray, shape (M, steps)
+            Simulated underlying asset price paths.
+        """
+        dW = np.random.normal(loc=0.0,
+                            scale=np.sqrt(self.dt),
+                            size=(self.M, self.steps - 1))
+
+        dN = np.random.poisson(lam=self.lam * self.dt,
+                            size=(self.M, self.steps - 1))
+
+        ZJ = np.random.normal(loc=0.0,
+                            scale=1.0,
+                            size=(self.M, self.steps - 1))
+
+        J = np.exp(self.meanJ + self.stdJ * ZJ)
+
+        # multiplicative Euler step with jumps
+        factors = 1.0 + self.mu * self.dt + self.sigma * dW + (J - 1.0) * dN
         factors = np.hstack((np.ones((self.M, 1)), factors))
+
         S = self.S0 * np.cumprod(factors, axis=1)
 
         self.S_Jump = S
         self.dW_Jump = dW
         self.dN_Jump = dN
         self.ZJ_Jump = ZJ
-        self.J_Jump  = J
+        self.J_Jump = J
 
-        return S, J
+        return S
 
-    def simulate_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-                                  np.ndarray, np.ndarray, np.ndarray]:
+    def simulate_H(self,
+                p_t: int = 1,
+                p_x: int = 2,
+                lam_ridge: float = 1e-2) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Mesmo esquema do GBM, mas inner paths seguem Merton.
+        Estimate H(t,S) = E[(S_T - K)^+ | S_t = S] and derivatives using a single pass
+        LSMC regression on the already simulated jump diffusion paths.
+
+        Approach
+        --------
+        - Regress payoff Y = (S_T - K)^+ on a tensor Chebyshev basis in (t, x),
+        where x = log(S), using ridge regularization.
+        - Compute derivatives analytically from the fitted basis in (t, x).
+        - Convert x derivatives to S derivatives via chain rule.
+        - Additionally evaluate H and dH dS at the post jump state S_jump = J * S
+        using the same fitted coefficients.
+
+        Parameters
+        ----------
+        p_t : int, default=1
+            Chebyshev degree in time
+        p_x : int, default=2
+            Chebyshev degree in x = log(S)
+        lam_ridge : float, default=1e-2
+            Ridge regularization
+
+        Returns
+        -------
+        H : ndarray, shape (M, steps)
+            Simulated contingent claim price paths.
+        dH_dS : ndarray, shape (M, steps)
+            First order derivative against underlying asset.
+        d2H_dSS : ndarray, shape (M, steps)
+            Second order derivative against underlying asset.
+        dH_dt : ndarray, shape (M, steps)
+            First order derivative against time.
+        d2H_dt_dS : ndarray, shape (M, steps)
+            Second order mixed derivative against time and underlying asset.
+        d3H_dS3 : ndarray, shape (M, steps)
+            Third order derivative against underlying asset.
+        H_jump : ndarray, shape (M, steps)
+            Price evaluated at the post jump state J times S.
+        dH_dS_jump : ndarray, shape (M, steps)
+            First order derivative evaluated at the post jump state J times S.
         """
-        S_path = self.S_path
-        M, N_time = S_path.shape
-        K_strike = self.K
-        mu = self.mu
-        sigma = self.sigma
-        dt = self.dt
+        if getattr(self, "S_Jump", None) is None:
+            raise ValueError("self.S_Jump is None. Run simulate_S() first.")
+        if getattr(self, "J_Jump", None) is None:
+            raise ValueError("self.J_Jump is None. Run simulate_S() first.")
 
-        S_min = S_path.min()
-        S_max = S_path.max()
-        margin = 0.1 * (S_max - S_min)
-        S_min -= margin
-        S_max += margin
+        # ----------------------------
+        # 1) Targets and state
+        # ----------------------------
+        Y = np.maximum(self.S_Jump[:, -1] - self.K, 0.0)
 
-        n_S_grid = 50
-        n_inner = 200
+        S_path = np.maximum(self.S_Jump, 1e-300)
+        J_path = np.maximum(self.J_Jump, 1e-300)
 
-        S_grid = np.linspace(S_min, S_max, n_S_grid)
+        X_path = np.log(S_path)                  # log(S)
+        X_jump_path = np.log(S_path * J_path)    # log(J*S) = log(S) + log(J)
 
-        H_grid = np.zeros((N_time, n_S_grid))
-        Delta_grid = np.zeros((N_time, n_S_grid))
-        Gamma_grid = np.zeros((N_time, n_S_grid))
-        dHdt_grid = np.zeros((N_time, n_S_grid))
-        d2H_dt_dS_grid = np.zeros((N_time, n_S_grid))
-        d3H_dS3_grid = np.zeros((N_time, n_S_grid))
+        t_grid = self.t0 + self.dt * np.arange(self.steps)
 
-        # terminal
-        H_grid[-1, :] = np.maximum(S_grid - K_strike, 0.0)
+        # ----------------------------
+        # 2) Scale (t, x) to [-1, 1]
+        # ----------------------------
+        x_min = float(min(X_path.min(), X_jump_path.min()))
+        x_max = float(max(X_path.max(), X_jump_path.max()))
+        if (not np.isfinite(x_min)) or (not np.isfinite(x_max)) or (x_max <= x_min):
+            raise ValueError("Invalid X_path range for scaling.")
 
-        # backward – nested MC com Merton
-        for n in reversed(range(N_time - 1)):
-            for k, s0 in enumerate(S_grid):
-                S_inner = np.full(n_inner, s0, float)
+        zt = tools._minmax_scale(t_grid, self.t0, self.T)                # (steps,)
+        zx = tools._minmax_scale(X_path.reshape(-1), x_min, x_max)       # (M*steps,)
+        zx_jump = tools._minmax_scale(X_jump_path.reshape(-1), x_min, x_max)
 
-                for j in range(n, N_time - 1):
-                    dW_inner = np.random.normal(0.0, np.sqrt(dt), size=n_inner)
-                    dN_inner = np.random.poisson(self.lam * dt, size=n_inner)
-                    ZJ_inner = np.random.normal(0.0, 1.0, size=n_inner)
-                    J_inner  = np.exp(self.mJ + self.sJ * ZJ_inner)
+        dz_dt = 2.0 / (self.T - self.t0)
+        dz_dx = 2.0 / (x_max - x_min)
 
-                    S_inner = (
-                        S_inner
-                        + mu * S_inner * dt
-                        + sigma * S_inner * dW_inner
-                        + S_inner * (J_inner - 1.0) * dN_inner
-                    )
+        # ----------------------------
+        # 3) Chebyshev basis and derivatives in (t, x)
+        # ----------------------------
+        Tt = tools._cheb_eval_all(zt, p_t, deriv=0)
+        dTt_dz = tools._cheb_eval_all(zt, p_t, deriv=1)
+        dTt_dt = dTt_dz * dz_dt
 
-                payoff_inner = np.maximum(S_inner - K_strike, 0.0)
-                H_grid[n, k] = payoff_inner.mean()
+        Tx = tools._cheb_eval_all(zx, p_x, deriv=0)
+        dTx_dz = tools._cheb_eval_all(zx, p_x, deriv=1)
+        d2Tx_dz2 = tools._cheb_eval_all(zx, p_x, deriv=2)
+        d3Tx_dz3 = tools._cheb_eval_all(zx, p_x, deriv=3)
 
-        # derivadas espaciais
-        dS = S_grid[1] - S_grid[0]
+        dTx_dx = dTx_dz * dz_dx
+        d2Tx_dx2 = d2Tx_dz2 * (dz_dx ** 2)
+        d3Tx_dx3 = d3Tx_dz3 * (dz_dx ** 3)
 
-        for n in range(N_time):
-            for k in range(1, n_S_grid - 1):
-                Delta_grid[n, k] = (H_grid[n, k + 1] - H_grid[n, k - 1]) / (2.0 * dS)
-                Gamma_grid[n, k] = (
-                    H_grid[n, k + 1] - 2.0 * H_grid[n, k] + H_grid[n, k - 1]
-                ) / (dS ** 2)
+        Tx_jump = tools._cheb_eval_all(zx_jump, p_x, deriv=0)
+        dTx_jump_dz = tools._cheb_eval_all(zx_jump, p_x, deriv=1)
+        dTx_jump_dx = dTx_jump_dz * dz_dx
 
-            Delta_grid[n, 0] = Delta_grid[n, 1]
-            Delta_grid[n, -1] = Delta_grid[n, -2]
-            Gamma_grid[n, 0] = Gamma_grid[n, 1]
-            Gamma_grid[n, -1] = Gamma_grid[n, -2]
+        # ----------------------------
+        # 4) Build design matrix Phi for tensor basis in (t, x)
+        # ----------------------------
+        N_obs = self.M * self.steps
+        P = (p_t + 1) * (p_x + 1)
+        Phi = np.empty((N_obs, P), dtype=float)
 
-            for k in range(1, n_S_grid - 1):
-                d3H_dS3_grid[n, k] = (Gamma_grid[n, k + 1] - Gamma_grid[n, k - 1]) / (2.0 * dS)
+        col = 0
+        for i in range(p_t + 1):
+            tt_rep = np.tile(Tt[:, i], self.M)
+            for j in range(p_x + 1):
+                Phi[:, col] = tt_rep * Tx[:, j]
+                col += 1
 
-            d3H_dS3_grid[n, 0] = d3H_dS3_grid[n, 1]
-            d3H_dS3_grid[n, -1] = d3H_dS3_grid[n, -2]
+        y = np.repeat(Y, self.steps)
 
-        # derivadas em t
-        for n in range(1, N_time - 1):
-            dHdt_grid[n, :] = (H_grid[n + 1, :] - H_grid[n - 1, :]) / (2.0 * dt)
-        dHdt_grid[0, :] = (H_grid[1, :] - H_grid[0, :]) / dt
-        dHdt_grid[-1, :] = (H_grid[-1, :] - H_grid[-2, :]) / dt
+        # ----------------------------
+        # 5) Fit ridge regression
+        # ----------------------------
+        beta = tools._ridge_solve(Phi, y, lam=lam_ridge)
+        B = beta.reshape(p_t + 1, p_x + 1)
 
-        # mista t,S
-        for n in range(N_time):
-            for k in range(1, n_S_grid - 1):
-                d2H_dt_dS_grid[n, k] = (dHdt_grid[n, k + 1] - dHdt_grid[n, k - 1]) / (2.0 * dS)
-            d2H_dt_dS_grid[n, 0] = d2H_dt_dS_grid[n, 1]
-            d2H_dt_dS_grid[n, -1] = d2H_dt_dS_grid[n, -2]
+        # ----------------------------
+        # 6) Evaluate H and derivatives in (t, x)
+        # ----------------------------
+        H_flat = np.zeros(N_obs, dtype=float)
+        Ht_flat = np.zeros(N_obs, dtype=float)
+        Hx_flat = np.zeros(N_obs, dtype=float)
+        Hxx_flat = np.zeros(N_obs, dtype=float)
+        Hxxx_flat = np.zeros(N_obs, dtype=float)
+        Htx_flat = np.zeros(N_obs, dtype=float)
 
-        # interp paths
-        H = np.zeros((M, N_time))
-        dH_dS = np.zeros((M, N_time))
-        d2H_dSS = np.zeros((M, N_time))
-        dH_dt = np.zeros((M, N_time))
-        d2H_dt_dS = np.zeros((M, N_time))
-        d3H_dS3 = np.zeros((M, N_time))
+        H_jump_flat = np.zeros(N_obs, dtype=float)
+        Hx_jump_flat = np.zeros(N_obs, dtype=float)
 
-        for n in range(N_time):
-            S_n = S_path[:, n]
-            H[:, n]          = np.interp(S_n, S_grid, H_grid[n, :])
-            dH_dS[:, n]      = np.interp(S_n, S_grid, Delta_grid[n, :])
-            d2H_dSS[:, n]    = np.interp(S_n, S_grid, Gamma_grid[n, :])
-            dH_dt[:, n]      = np.interp(S_n, S_grid, dHdt_grid[n, :])
-            d2H_dt_dS[:, n]  = np.interp(S_n, S_grid, d2H_dt_dS_grid[n, :])
-            d3H_dS3[:, n]    = np.interp(S_n, S_grid, d3H_dS3_grid[n, :])
+        for i in range(p_t + 1):
+            tt0 = np.tile(Tt[:, i], self.M)
+            tt1 = np.tile(dTt_dt[:, i], self.M)
 
-        self.S_grid = S_grid
-        self.H_grid = H_grid
-        self.Delta_grid = Delta_grid
-        self.Gamma_grid = Gamma_grid
-        self.dHdt_grid = dHdt_grid
-        self.d2H_dt_dS_grid = d2H_dt_dS_grid
-        self.d3H_dS3_grid = d3H_dS3_grid
+            for j in range(p_x + 1):
+                Bij = B[i, j]
+                if Bij == 0.0:
+                    continue
 
-        dH_dt = dH_dt / 100.0
-        d2H_dt_dS = d2H_dt_dS / 100.0
+                x0 = Tx[:, j]
+                x1 = dTx_dx[:, j]
+                x2 = d2Tx_dx2[:, j]
+                x3 = d3Tx_dx3[:, j]
 
-        self.H = H
-        self.dH_dS = dH_dS
-        self.d2H_dSS = d2H_dSS
-        self.dH_dt = dH_dt
-        self.d2H_dt_dS = d2H_dt_dS
-        self.d3H_dS3 = d3H_dS3
+                H_flat += Bij * (tt0 * x0)
+                Ht_flat += Bij * (tt1 * x0)
 
-        return H, dH_dS, d2H_dSS, dH_dt, d2H_dt_dS, d3H_dS3
+                Hx_flat += Bij * (tt0 * x1)
+                Hxx_flat += Bij * (tt0 * x2)
+                Hxxx_flat += Bij * (tt0 * x3)
+
+                Htx_flat += Bij * (tt1 * x1)
+
+                x0j = Tx_jump[:, j]
+                x1j = dTx_jump_dx[:, j]
+
+                H_jump_flat += Bij * (tt0 * x0j)
+                Hx_jump_flat += Bij * (tt0 * x1j)
+
+        H = H_flat.reshape(self.M, self.steps)
+        H = np.maximum(H, 0.0)
+
+        H_t = Ht_flat.reshape(self.M, self.steps)
+
+        H_x = Hx_flat.reshape(self.M, self.steps)
+        H_xx = Hxx_flat.reshape(self.M, self.steps)
+        H_xxx = Hxxx_flat.reshape(self.M, self.steps)
+
+        H_tx = Htx_flat.reshape(self.M, self.steps)
+
+        H_jump = H_jump_flat.reshape(self.M, self.steps)
+        H_jump = np.maximum(H_jump, 0.0)
+
+        H_x_jump = Hx_jump_flat.reshape(self.M, self.steps)
+
+        # ----------------------------
+        # 7) Convert x=log(S) derivatives to S derivatives
+        # ----------------------------
+        S = np.maximum(self.S_Jump, 1e-300)
+
+        dH_dS = (1.0 / S) * H_x
+        d2H_dSS = (1.0 / (S ** 2)) * (H_xx - H_x)
+        d3H_dS3 = (1.0 / (S ** 3)) * (H_xxx - 3.0 * H_xx + 2.0 * H_x)
+
+        dH_dt = H_t
+        d2H_dtdS = (1.0 / S) * H_tx
+
+        S_jump = np.maximum(self.S_Jump * self.J_Jump, 1e-300)
+        dH_dS_jump = (1.0 / S_jump) * H_x_jump
+
+        # ----------------------------
+        # 8) Store
+        # ----------------------------
+        self.H_Jump = H
+
+        self.dH_dS_Jump = dH_dS
+        self.d2H_dSS_Jump = d2H_dSS
+        self.dH_dt_Jump = dH_dt
+        self.d2H_dtdS_Jump = d2H_dtdS
+        self.d3H_dS3_Jump = d3H_dS3
+
+        self.H_jump_Jump = H_jump
+        self.dH_dS_jump_Jump = dH_dS_jump
+
+        self._H_fit_Jump = {
+            "p_t": p_t,
+            "p_x": p_x,
+            "lam_ridge": lam_ridge,
+            "x_min": x_min,
+            "x_max": x_max,
+            "beta": beta,
+        }
+
+        return H, dH_dS, d2H_dSS, dH_dt, d2H_dtdS, d3H_dS3, H_jump, dH_dS_jump
+   
+
 
     # ============================================================
     # 1. Control initialization
     # ============================================================
+    def init_control(self, kind: str = "Delta") -> np.ndarray:
+        """
+        Initialize the control h.
 
-    def init_control(self, kind: str = "delta") -> np.ndarray:
-        S_path = self.S_path
-        dH_dS = self.dH_dS
-        M, steps = S_path.shape
+        Parameters
+        ----------
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
 
-        if kind == "delta":
-            h0 = dH_dS[:, :-1].copy()
+            Delta  : h = dH_dS
+            MinVar : scalar h that minimizes the instantaneous variance combining
+                    diffusion and jump components.
+            zero   : h = 0
+
+        Returns
+        -------
+        h : ndarray, shape (M, steps-1)
+            Initial control on each time interval [t_n, t_{n+1}).
+        """
+        if kind == "Delta":
+            if getattr(self, "dH_dS_Jump", None) is None:
+                raise ValueError("Missing dH_dS_Jump. Run simulate_H() first.")
+            h0 = self.dH_dS_Jump[:, :-1].copy()
+
+        elif kind == "MinVar":
+            if getattr(self, "dH_dS_Jump", None) is None or getattr(self, "H_Jump", None) is None or getattr(self, "H_jump_Jump", None) is None:
+                raise ValueError("Missing derivatives. Run simulate_H() first.")
+
+            S = np.maximum(self.S_Jump[:, :-1], 1e-12)
+
+            Delta = self.dH_dS_Jump[:, :-1]
+            H0 = self.H_Jump[:, :-1]
+            HJ = self.H_jump_Jump[:, :-1]
+
+            dH_jump = HJ - H0
+
+            Jm1 = np.maximum(self.J_Jump[:, :-1] - 1.0, -1e12)
+
+            num = (self.sigma ** 2) * (S ** 2) * Delta + self.lam * (dH_jump * S * Jm1)
+            den = (self.sigma ** 2) * (S ** 2) + self.lam * (S ** 2) * (Jm1 ** 2)
+
+            h0 = num / np.maximum(den, 1e-16)
+            h0 = h0.copy()
+
         elif kind == "zero":
-            h0 = np.zeros((M, steps - 1))
+            h0 = np.zeros((self.M, self.steps - 1), dtype=float)
+
         else:
             raise ValueError("Unknown control initialization kind")
 
         return h0
 
+
     # ============================================================
     # 2. Forward P&L
     # ============================================================
+    def forward_PL(self,
+                h: np.ndarray,
+                L0: float = 0.0,
+                t_start: int = 0) -> np.ndarray:
+        """
+        Vectorized Profit and Loss L_t using portfolio value.
 
-    def forward_PL(self, h: np.ndarray, L0: float = 0.0) -> np.ndarray:
-        S_path = self.S_path
-        H      = self.H
+        If start_idx > 0, the profit and loss is forced to be zero for all times
+        before start_idx, so that L[:, -1] represents the residual profit and loss
+        from t_start to T.
 
-        M, steps = S_path.shape
-        assert h.shape == (M, steps - 1)
+        Parameters
+        ----------
+        h : ndarray, shape (M, steps-1)
+            Hedge ratio on each interval [t_n, t_{n+1}).
+        L0 : float, default=0.0
+            Initial profit and loss level.
+        t_start : float, default=0
+            Time index at which profit and loss accumulation starts.
 
-        L = np.zeros((M, steps))
+        Returns
+        -------
+        L : ndarray, shape (M, steps)
+            Profit and loss paths over time.
+        """
+        assert h.shape == (self.M, self.steps - 1)
+        assert self.t0 <= t_start <= self.T
+        start_idx = tools._time_to_index(N=self.N, t0=self.t0, T=self.T, t_start=t_start)
+
+        # increments occur at times 1,...,steps-1
+        dS = np.diff(self.S_Jump, axis=1)          # (M, steps-1)
+        dH = np.diff(self.H_Jump, axis=1)          # (M, steps-1)
+        dL = h * dS - dH                           # (M, steps-1)
+
+        # cut past
+        if start_idx > 0:
+            dL = dL.copy()
+            dL[:, :start_idx] = 0.0
+
+        # cumulative profit and loss
+        L = np.zeros((self.M, self.steps), dtype=float)
         L[:, 0] = L0
-
-        for n in range(steps - 1):
-            dS = S_path[:, n + 1] - S_path[:, n]
-            dH = H[:, n + 1]      - H[:, n]
-            L[:, n + 1] = L[:, n] + h[:, n] * dS - dH
+        L[:, 1:] = L0 + np.cumsum(dL, axis=1)
 
         return L
 
-    # ============================================================
-    # 3. Risk functional
-    # ============================================================
-
-    @staticmethod
-    def risk_function(LT: np.ndarray, risk_type: str, **kwargs) -> float:
-        """
-        Compute rho_u(L_T) for different risk specifications.
-
-        risk_type in {"ele","elw","entl","ente","entw","es"}.
-        """
-        LT = np.asarray(LT)
-
-        if risk_type == "ele":
-            a = kwargs.get("a")
-            if a is None:
-                raise ValueError("Parameter 'a' is required for 'ele'.")
-            rho = np.mean(np.exp(-a * LT))
-
-        elif risk_type == "elw":
-            k = kwargs.get("k")
-            if k is None:
-                raise ValueError("Parameter 'k' is required for 'elw'.")
-            loss = -np.minimum(LT, 0.0)
-            rho = np.mean(np.exp(loss**k))
-
-        elif risk_type == "entl":
-            gamma = kwargs.get("gamma")
-            if gamma is None:
-                raise ValueError("Parameter 'gamma' is required for 'entl'.")
-            w = np.exp(-gamma * LT)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
-
-        elif risk_type == "ente":
-            gamma = kwargs.get("gamma")
-            a = kwargs.get("a")
-            if gamma is None or a is None:
-                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
-            v = np.exp(-a * LT)
-            w = np.exp(gamma * v)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
-
-        elif risk_type == "entw":
-            # Entropic with Weibull-type utility:
-            # v(X)   = exp( ( -min(X/scale, 0) )^k )
-            # rho(X) = (1/gamma) log E[ exp( gamma * v(X) ) ]
-            gamma = kwargs.get("gamma")
-            k     = kwargs.get("k")
-            scale = kwargs.get("scale", 20.0)  # internal scaling to stabilize numerics
-            if gamma is None or k is None:
-                raise ValueError("Parameters 'gamma' and 'k' are required for risk_type='entw'.")
-
-            # Scale the P&L to reduce loss magnitude inside exponentials
-            LT_scaled = LT / scale
-
-            # Loss = -min(LT_scaled, 0)  >= 0
-            loss = -np.minimum(LT_scaled, 0.0)
-
-            # Inner power: g = loss^k
-            g = loss**k
-            # Clip g to avoid huge exponents in exp(g)
-            g = np.clip(g, 0.0, 10.0)  # exp(10) ~ 2.2e4 -> still safe
-
-            # v = exp(g)
-            v = np.exp(g)
-
-            # Outer exponent: z = gamma * v
-            z = gamma * v
-            # Clip again before exp(z)
-            z = np.clip(z, -20.0, 20.0)  # exp(20) ~ 4.8e8 -> safe
-
-            w = np.exp(z)  # exp(gamma * v)
-            rho = (1.0 / gamma) * np.log(np.mean(w))
 
 
-        elif risk_type == "es":
-            beta = kwargs.get("beta")
-            if beta is None:
-                raise ValueError("Parameter 'beta' is required for 'es'.")
-            alpha = kwargs.get("alpha")
-            if alpha is None:
-                alpha = np.quantile(LT, beta)
-            excess = np.maximum(LT - alpha, 0.0)
-            rho = alpha + (1.0 / (1.0 - beta)) * np.mean(excess)
-
-        else:
-            raise ValueError(f"Unknown risk_type '{risk_type}'.")
-
-        return rho
-
-    # ============================================================
-    # 4. Terminal adjoint
-    # ============================================================
-
-    @staticmethod
-    def terminal_adjoint(LT: np.ndarray, risk_type: str, **kwargs) -> Tuple[np.ndarray, Dict]:
-        """
-        Compute p_T = Upsilon(L_T) for the given risk_type.
-        """
-        LT = np.asarray(LT)
-
-        if risk_type == "ele":
-            a = kwargs.get("a")
-            if a is None:
-                raise ValueError("Parameter 'a' is required for 'ele'.")
-            pT = -a * np.exp(-a * LT)
-            info = {}
-
-        elif risk_type == "elw":
-            k = kwargs.get("k")
-            if k is None:
-                raise ValueError("Parameter 'k' is required for 'elw'.")
-            loss = -np.minimum(LT, 0.0)
-            pT = -k * (loss**(k - 1.0)) * np.exp(loss**k)
-            info = {}
-
-        elif risk_type == "entl":
-            gamma = kwargs.get("gamma")
-            if gamma is None:
-                raise ValueError("Parameter 'gamma' is required for 'entl'.")
-            w = np.exp(-gamma * LT)
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-linear.")
-            pT = -w / den
-            info = {"denominator": den}
-
-        elif risk_type == "ente":
-            gamma = kwargs.get("gamma")
-            a = kwargs.get("a")
-            if gamma is None or a is None:
-                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
-            v = np.exp(-a * LT)
-            w = np.exp(gamma * v)
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-exponential.")
-            pT = -a * v * w / den
-            info = {"denominator": den}
-
-        elif risk_type == "entw":
-            # Terminal adjoint for entropic-Weibull with internal scaling:
-            gamma = kwargs.get("gamma")
-            k     = kwargs.get("k")
-            scale = kwargs.get("scale", 20.0)
-            if gamma is None or k is None:
-                raise ValueError("Parameters 'gamma' and 'k' are required for risk_type='entw'.")
-
-            LT_scaled = LT / scale
-            loss = -np.minimum(LT_scaled, 0.0)  # >= 0
-
-            # Inner power and its exp
-            g = loss**k
-            g = np.clip(g, 0.0, 10.0)
-            v = np.exp(g)                       # v(L/scale)
-
-            # Outer exponent
-            z = gamma * v
-            z = np.clip(z, -20.0, 20.0)
-            w = np.exp(z)                       # exp(gamma * v)
-
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-Weibull Upsilon.")
-
-            # v'(y) where y = LT_scaled:
-            # loss = -min(y,0), so for y<0: loss = -y -> d(loss)/dy = -1
-            # g = loss^k -> g' = k * loss^(k-1) * d(loss)/dy = -k * loss^(k-1)
-            # v = exp(g) -> v' = v * g' = -k * loss^(k-1) * v
-            v_prime = -k * (loss**(k - 1.0)) * v
-
-            # Base adjoint w.r.t. LT_scaled:
-            p_base = v_prime * w / den
-
-            # Chain rule: LT_scaled = LT / scale -> d/dLT = (1/scale) d/d(LT_scaled)
-            pT = (1.0 / scale) * p_base
-
-            info = {"denominator": den}
-
-
-        elif risk_type == "es":
-            beta = kwargs.get("beta")
-            if beta is None:
-                raise ValueError("Parameter 'beta' is required for 'es'.")
-            alpha = kwargs.get("alpha")
-            if alpha is None:
-                alpha = np.quantile(LT, beta)
-            indicator = (LT >= alpha).astype(float)
-            pT = indicator / (1.0 - beta)
-            info = {"alpha_star": alpha}
-
-        else:
-            raise ValueError(f"Unknown risk_type '{risk_type}'.")
-
-        return pT, info
     # ============================================================
     # 5. Backward adjoint: agora com r_t (salto)
     # ============================================================

@@ -161,7 +161,6 @@ class HestonSimulator(BaseSimulator):
 
         return S, v
 
-
     def simulate_H(self,
                    p_t: int = 1,
                    p_x: int = 2,
