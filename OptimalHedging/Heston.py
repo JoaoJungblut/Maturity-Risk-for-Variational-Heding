@@ -4,14 +4,64 @@ import numpy as np
 from typing import Dict, List, Tuple
 
 
+
 class HestonSimulator(BaseSimulator):
     """
-    Simulator for the Heston model with optimal hedging machinery.
+    Simulator for Heston process with optimal hedging machinery.
 
-    This class implements the model-specific components associated with the
-    Heston stochastic volatility dynamics. It follows the same overall hedging
-    workflow used in GBMSimulator, but replaces the underlying simulation and
-    any model-dependent quantities accordingly.
+    This class implements all model-dependent components required to solve the
+    optimal hedging problem under a Stochastic Volatility dynamics. All
+    methods below are specific to the GBM model and are therefore implemented
+    directly in this class. Only the terminal risk functional and the control
+    update rule are inherited from BaseSimulator.
+
+    Implemented methods
+    -------------------
+    - __init__ :
+        Initializes the simulator and forwards all parameters to BaseSimulator.
+
+    - simulate_S :
+        Simulates Heston paths for the underlying asset and stores both S_Heston, v_Heston and
+        the corresponding Brownian increments dW1_Heston and dW2_Heston.
+
+    - simulate_H :
+        Computes the contingent claim price H(t, S) and its time and space
+        derivatives using a single-pass LSMC regression on a Chebyshev basis.
+
+    - init_control :
+        Initializes the hedging control, typically using the Delta of the
+        contingent claim as a smooth initial guess.
+
+    - forward_PL :
+        Simulates the forward Profit and Loss process associated with a given
+        hedging strategy under the Heston dynamics.
+
+    - backward_adjoint :
+        Solves the backward adjoint equation associated with the Heston optimal
+        hedging problem using regression-based conditional expectations.
+
+    - compute_gradient :
+        Computes the Heston-specific optimality condition (gradient) used to update
+        the control process.
+
+    - optimize_hedge :
+        Runs the full iterative optimization loop to compute an approximate
+        optimal hedge under the chosen risk functional.
+
+    - compute_MR :
+        Computes the maturity risk by comparing optimal risks on sub-horizons
+        and on the full time horizon.
+
+    Inherited from BaseSimulator
+    ----------------------------
+    - risk_function :
+        Evaluation of the terminal composed risk functional.
+
+    - terminal_adjoint :
+        Computation of the terminal adjoint associated with the risk functional.
+
+    - update_control :
+        Generic control update rule based on a normalized gradient step.
     """
 
     def __init__(self,
@@ -348,27 +398,6 @@ class HestonSimulator(BaseSimulator):
         d2H_dt_dv = H_tv
 
         # ----------------------------
-        # 7b) Enforce terminal condition exactly (payoff does not depend on v)
-        # ----------------------------
-        payoff_T = np.maximum(self.S_Heston[:, -1] - self.K, 0.0)
-        H[:, -1] = payoff_T
-
-        dH_dS[:, -1] = (self.S_Heston[:, -1] > self.K).astype(float)
-        d2H_dSS[:, -1] = 0.0
-        d3H_dS3[:, -1] = 0.0
-
-        dH_dv[:, -1] = 0.0
-        d2H_dvv[:, -1] = 0.0
-        d3H_dv3[:, -1] = 0.0
-
-        d2H_dSdv[:, -1] = 0.0
-        d3H_dS2dv[:, -1] = 0.0
-        d3H_dSdvv[:, -1] = 0.0
-        d2H_dt_dv[:, -1] = 0.0
-        d2H_dtdS[:, -1] = 0.0
-        dH_dt[:, -1] = 0.0
-
-        # ----------------------------
         # 8) Store
         # ----------------------------
         self.H_Heston = H
@@ -412,7 +441,7 @@ class HestonSimulator(BaseSimulator):
     # ============================================================
     # 1. Control initialization
     # ============================================================
-    def init_control(self, kind: str = "MinVar") -> np.ndarray:
+    def init_control(self, kind: str = "Delta") -> np.ndarray:
         """
         Initialize the control h.
 
@@ -440,18 +469,14 @@ class HestonSimulator(BaseSimulator):
             if getattr(self, "dH_dS_Heston", None) is None or getattr(self, "dH_dv_Heston", None) is None:
                 raise ValueError("Missing derivatives. Run simulate_H() first.")
 
+            S = np.maximum(self.S_Heston[:, :-1], 1e-12)
+
             Delta = self.dH_dS_Heston[:, :-1]
             Vega  = self.dH_dv_Heston[:, :-1]
 
-            a = float(self.sigma_v)
-            r = float(self.corr)
+            # Minimum variance projection of dv-risk onto dS
+            h0 = Delta + self.corr * self.sigma_v * Vega / S
 
-            denom = 1.0 + a * a + 2.0 * r * a
-            if abs(denom) < 1e-12:
-                raise ValueError("Invalid parameters: denominator too small in MinVar initialization.")
-
-            # h = argmin_h ( (h-Delta)^2 + (a*h - Vega)^2 + 2*r*(h-Delta)*(a*h - Vega) )
-            h0 = ((1.0 + r * a) * Delta + (a + r) * Vega) / denom
             h0 = h0.copy()
 
         elif kind == "zero":
