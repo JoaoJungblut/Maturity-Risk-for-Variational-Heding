@@ -311,14 +311,15 @@ class GBMSimulator(BaseSimulator):
         dH = np.diff(self.H_GBM, axis=1)        # (M, steps-1)
         dL = h * dS - dH                        # (M, steps-1)
 
+        # cut past
+        if start_idx > 0:
+            dL = dL.copy()
+            dL[:, :start_idx] = 0.0
+        
         # cumulative P&L
         L = np.zeros((self.M, self.steps))
         L[:, 0] = L0
         L[:, 1:] = L0 + np.cumsum(dL, axis=1)
-
-        # cut past
-        if start_idx > 0:
-            L[:, :start_idx] = 0.0
 
         return L
 
@@ -979,5 +980,6 @@ class GBMSimulator(BaseSimulator):
         MR = rho_t - rho_T
 
         return MR, {"h_T": h_T, "h_t": h_t, "rho_T": rho_T, "rho_t": rho_t}
+    
 
     
