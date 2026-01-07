@@ -518,276 +518,485 @@ class HestonSimulator(BaseSimulator):
 
 
     # ============================================================
-    # 3. Risk functional  (mesmo do GBM)
-    # ============================================================
-
-    @staticmethod
-    def risk_function(LT: np.ndarray, risk_type: str, **kwargs) -> float:
-        LT = np.asarray(LT)
-
-        if risk_type == "ele":
-            a = kwargs.get("a")
-            if a is None:
-                raise ValueError("Parameter 'a' is required for 'ele'.")
-            rho = np.mean(np.exp(-a * LT))
-
-        elif risk_type == "elw":
-            k = kwargs.get("k")
-            if k is None:
-                raise ValueError("Parameter 'k' is required for 'elw'.")
-            loss = -np.minimum(LT, 0.0)
-            rho = np.mean(np.exp(loss**k))
-
-        elif risk_type == "entl":
-            gamma = kwargs.get("gamma")
-            if gamma is None:
-                raise ValueError("Parameter 'gamma' is required for 'entl'.")
-            w = np.exp(-gamma * LT)
-            den = np.mean(w)
-            rho = (1.0 / gamma) * np.log(den)
-
-        elif risk_type == "ente":
-            gamma = kwargs.get("gamma")
-            a = kwargs.get("a")
-            if gamma is None or a is None:
-                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
-            v = np.exp(-a * LT)
-            w = np.exp(gamma * v)
-            den = np.mean(w)
-            rho = (1.0 / gamma) * np.log(den)
-
-        elif risk_type == "entw":
-            gamma = kwargs.get("gamma")
-            k     = kwargs.get("k")
-            scale = kwargs.get("scale", 20.0)
-            if gamma is None or k is None:
-                raise ValueError("Parameters 'gamma' and 'k' are required for 'entw'.")
-            LT_scaled = LT / scale
-            loss = -np.minimum(LT_scaled, 0.0)
-            g = np.clip(loss**k, 0.0, 10.0)
-            v = np.exp(g)
-            z = np.clip(gamma * v, -20.0, 20.0)
-            w = np.exp(z)
-            den = np.mean(w)
-            rho = (1.0 / gamma) * np.log(den)
-
-        elif risk_type == "es":
-            beta = kwargs.get("beta")
-            if beta is None:
-                raise ValueError("Parameter 'beta' is required for 'es'.")
-            alpha = kwargs.get("alpha")
-            if alpha is None:
-                alpha = np.quantile(LT, beta)
-            excess = np.maximum(LT - alpha, 0.0)
-            rho = alpha + (1.0 / (1.0 - beta)) * np.mean(excess)
-
-        else:
-            raise ValueError(f"Unknown risk_type '{risk_type}'.")
-
-        return rho
-
-    # ============================================================
-    # 4. Terminal adjoint (mesmo do GBM)
-    # ============================================================
-
-    @staticmethod
-    def terminal_adjoint(LT: np.ndarray, risk_type: str, **kwargs) -> Tuple[np.ndarray, Dict]:
-        LT = np.asarray(LT)
-
-        if risk_type == "ele":
-            a = kwargs.get("a")
-            if a is None:
-                raise ValueError("Parameter 'a' is required for 'ele'.")
-            pT = -a * np.exp(-a * LT)
-            info = {}
-
-        elif risk_type == "elw":
-            k = kwargs.get("k")
-            if k is None:
-                raise ValueError("Parameter 'k' is required for 'elw'.")
-            loss = -np.minimum(LT, 0.0)
-            pT = -k * (loss**(k - 1.0)) * np.exp(loss**k)
-            info = {}
-
-        elif risk_type == "entl":
-            gamma = kwargs.get("gamma")
-            if gamma is None:
-                raise ValueError("Parameter 'gamma' is required for 'entl'.")
-            w = np.exp(-gamma * LT)
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-linear.")
-            pT = -w / den
-            info = {"denominator": den}
-
-        elif risk_type == "ente":
-            gamma = kwargs.get("gamma")
-            a = kwargs.get("a")
-            if gamma is None or a is None:
-                raise ValueError("Parameters 'gamma' and 'a' are required for 'ente'.")
-            v = np.exp(-a * LT)
-            w = np.exp(gamma * v)
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-exponential.")
-            pT = -a * v * w / den
-            info = {"denominator": den}
-
-        elif risk_type == "entw":
-            gamma = kwargs.get("gamma")
-            k     = kwargs.get("k")
-            scale = kwargs.get("scale", 20.0)
-            if gamma is None or k is None:
-                raise ValueError("Parameters 'gamma' and 'k' are required for 'entw'.")
-            LT_scaled = LT / scale
-            loss = -np.minimum(LT_scaled, 0.0)
-            g = np.clip(loss**k, 0.0, 10.0)
-            v = np.exp(g)
-            z = np.clip(gamma * v, -20.0, 20.0)
-            w = np.exp(z)
-            den = np.mean(w)
-            if den <= 0.0:
-                raise ValueError("Non-positive denominator in entropic-Weibull.")
-            v_prime = -k * (loss**(k - 1.0)) * v
-            p_base = v_prime * w / den
-            pT = (1.0 / scale) * p_base
-            info = {"denominator": den}
-
-        elif risk_type == "es":
-            beta = kwargs.get("beta")
-            if beta is None:
-                raise ValueError("Parameter 'beta' is required for 'es'.")
-            alpha = kwargs.get("alpha")
-            if alpha is None:
-                alpha = np.quantile(LT, beta)
-            indicator = (LT >= alpha).astype(float)
-            pT = indicator / (1.0 - beta)
-            info = {"alpha_star": alpha}
-
-        else:
-            raise ValueError(f"Unknown risk_type '{risk_type}'.")
-
-        return pT, info
-
-    # ============================================================
     # 5. Backward adjoint (driver tipo GBM, mas com v_t em σ_t)
     # ============================================================
+    def backward_adjoint(self,
+                         pT: np.ndarray,
+                         p_x: int = 2,
+                         p_v: int = 1,
+                         lam_ridge: float = 1e-2,
+                         lam_time: float = 1e-2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Solve the backward adjoint BSDE for the Heston model by a discrete-time backward scheme with regression.
 
-    def backward_adjoint(self, pT):
-        S_path    = self.S_path
-        v_path    = self.v_path
-        dW        = self.dW
-        d2H_dt_dS = self.d2H_dt_dS
-        d2H_dSS   = self.d2H_dSS
-        d3H_dS3   = self.d3H_dS3
-        dt = self.dt
+        - Two Brownian drivers imply two martingale components: q1 and q2.
+        - Conditional expectations are approximated via a tensor Chebyshev basis in (x, v),
+        where x = log(S).
+        - Ridge regularization and temporal smoothing are applied to regression coefficients.
 
-        M, steps = S_path.shape
-        p = np.zeros((M, steps))
-        q = np.zeros((M, steps-1))
-        p[:, -1] = pT
+        Parameters
+        ----------
+        pT : ndarray, shape (M,)
+            Terminal adjoint values.
+        p_x : int, default=2
+            Chebyshev degree in x = log(S).
+        p_v : int, default=1
+            Chebyshev degree in v.
+        lam_ridge : float, default=1e-2
+            Ridge regularization.
+        lam_time : float, default=1e-2
+            Temporal smoothing.
 
-        for n in reversed(range(steps-1)):
-            Sn = S_path[:, n]
-            vn = np.maximum(v_path[:, n], 1e-8)
-            sigma_n = np.sqrt(vn)
-            dWn = dW[:, n]
+        Returns
+        -------
+        p : ndarray, shape (M, steps)
+            Adjoint process.
+        q1 : ndarray, shape (M, steps-1)
+            Martingale component for dW1.
+        q2 : ndarray, shape (M, steps-1)
+            Martingale component for dW2.
+        """
+        if getattr(self, "S_Heston", None) is None or getattr(self, "v_Heston", None) is None:
+            raise ValueError("Missing Heston paths. Run simulate_S() first.")
+        if getattr(self, "dW1_Heston", None) is None or getattr(self, "dW2_Heston", None) is None:
+            raise ValueError("Missing Brownian increments. Run simulate_S() first.")
+        if getattr(self, "H_Heston", None) is None:
+            raise ValueError("Missing H. Run simulate_H() first.")
 
-            d2H_dt_dS_n = 100.0 * d2H_dt_dS[:, n]
-            d2H_dSS_n   = d2H_dSS[:, n]
-            d3H_dS3_n   = d3H_dS3[:, n]
+        # required H derivatives for the driver
+        req = [
+            "dH_dS_Heston", "d2H_dSS_Heston", "d2H_dSdv_Heston",
+            "d2H_dtdS_Heston", "d3H_dS3_Heston", "d3H_dS2dv_Heston", "d3H_dSdvv_Heston"
+        ]
+        for name in req:
+            if getattr(self, name, None) is None:
+                raise ValueError(f"Missing {name}. Run simulate_H() first.")
 
-            A_n = d2H_dt_dS_n + 0.5 * (sigma_n**2) * (
-                2.0 * Sn * d2H_dSS_n + (Sn**2) * d3H_dS3_n
+        p = np.zeros((self.M, self.steps), dtype=float)
+        q1 = np.zeros((self.M, self.steps - 1), dtype=float)
+        q2 = np.zeros((self.M, self.steps - 1), dtype=float)
+        p[:, -1] = np.asarray(pT, dtype=float)
+
+        # regressors: x = log(S), v = v
+        S_all = np.maximum(self.S_Heston, 1e-300)
+        X_all = np.log(S_all)
+        V_all = np.maximum(self.v_Heston, 0.0)
+
+        x_min = float(X_all.min())
+        x_max = float(X_all.max())
+        v_min = float(V_all.min())
+        v_max = float(V_all.max())
+
+        if (not np.isfinite(x_min)) or (not np.isfinite(x_max)) or (x_max <= x_min):
+            raise ValueError("Invalid scaling range for log(S).")
+        if (not np.isfinite(v_min)) or (not np.isfinite(v_max)) or (v_max <= v_min):
+            raise ValueError("Invalid scaling range for v.")
+
+        Px = p_x + 1
+        Pv = p_v + 1
+        P = Px * Pv
+
+        beta_p_next = np.zeros(P)
+        beta_q1_next = np.zeros(P)
+        beta_q2_next = np.zeros(P)
+
+        eps = 1e-12
+
+        for n in range(self.steps - 2, -1, -1):
+            Sn = self.S_Heston[:, n]
+            vn = np.maximum(self.v_Heston[:, n], 0.0)
+            sqrt_vn = np.sqrt(vn + eps)
+
+            dW1n = self.dW1_Heston[:, n]
+            dW2n = self.dW2_Heston[:, n]
+
+            # build tensor Chebyshev features Phi(x_n, v_n)
+            x_n = X_all[:, n]
+            v_n = vn
+
+            zx = tools._minmax_scale(x_n, x_min, x_max)
+            zv = tools._minmax_scale(v_n, v_min, v_max)
+
+            Tx = tools._cheb_eval_all(zx, p_x, deriv=0)  # (M, Px)
+            Tv = tools._cheb_eval_all(zv, p_v, deriv=0)  # (M, Pv)
+
+            Phi = np.empty((self.M, P), dtype=float)
+            col = 0
+            for i in range(Px):
+                for j in range(Pv):
+                    Phi[:, col] = Tx[:, i] * Tv[:, j]
+                    col += 1
+
+            p_next = p[:, n + 1]
+
+            # q1_n and q2_n via martingale representation
+            y_q1 = (p_next * dW1n) / self.dt
+            beta_q1 = tools._solve_smoothed(Phi, y_q1, beta_q1_next, lam_ridge, lam_time)
+            q1[:, n] = Phi @ beta_q1
+
+            y_q2 = (p_next * dW2n) / self.dt
+            beta_q2 = tools._solve_smoothed(Phi, y_q2, beta_q2_next, lam_ridge, lam_time)
+            q2[:, n] = Phi @ beta_q2
+
+            # driver terms (at time n)
+            H_S   = self.dH_dS_Heston[:, n]
+            H_SS  = self.d2H_dSS_Heston[:, n]
+            H_Sv  = self.d2H_dSdv_Heston[:, n]
+
+            H_tS    = self.d2H_dtdS_Heston[:, n]
+            H_SSS   = self.d3H_dS3_Heston[:, n]
+            H_SSv   = self.d3H_dS2dv_Heston[:, n]
+            H_Svv   = self.d3H_dSdvv_Heston[:, n]
+
+            # main drift coefficient multiplying p
+            C_n = (
+                H_tS
+                + self.mu * Sn * H_SS
+                + self.kappa * (self.theta - vn) * H_Sv
+                + 0.5 * vn * (Sn ** 2) * H_SSS
+                + 0.5 * (self.sigma_v ** 2) * vn * H_Svv
+                + self.corr * self.sigma_v * vn * Sn * H_SSv
             )
 
-            p_next = p[:, n+1]
-            p_n = p_next - A_n * p_next * dt
-            p[:, n] = p_n
+            # extra drift terms involving q1 and q2
+            term_q1 = -sqrt_vn * (H_S + Sn * H_SS) * q1[:, n]
+            term_q2 = (self.sigma_v * sqrt_vn * H_Sv) * q2[:, n]
 
-            denom = dWn.copy()
-            denom[np.abs(denom) < 1e-8] = 1e-8
-            q[:, n] = (p_next - p_n - A_n * p_n * dt) / denom
+            drift_p = C_n * p_next + term_q1 + term_q2
 
-        return p, q
+            y_p = p_next - drift_p * self.dt
+            beta_p = tools._solve_smoothed(Phi, y_p, beta_p_next, lam_ridge, lam_time)
+            p[:, n] = Phi @ beta_p
+
+            beta_q1_next = beta_q1
+            beta_q2_next = beta_q2
+            beta_p_next = beta_p
+
+        self._backward_fit_Heston = {
+            "p_x": p_x,
+            "p_v": p_v,
+            "lam_ridge": lam_ridge,
+            "lam_time": lam_time,
+            "x_min": x_min,
+            "x_max": x_max,
+            "v_min": v_min,
+            "v_max": v_max,
+        }
+
+        self.p_Heston = p
+        self.q1_Heston = q1
+        self.q2_Heston = q2
+
+        return p, q1, q2
+
+
 
     # ============================================================
     # 6. Gradient (aqui entra o ∂_h H correto do Heston sem q^ν)
     # ============================================================
-
-    def compute_gradient(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    def compute_gradient(self,
+                         p: np.ndarray,
+                         q1: np.ndarray,
+                         q2: np.ndarray,
+                         eps: float = 1e-12) -> np.ndarray:
         """
-        G_n ≈ (μ S_n + κ(θ - v_n)) p_n + sqrt(v_n) S_n q_n.
-        (termo em σ_v sqrt(v_n) q^ν é ignorado porque o código
-        não tem o segundo componente de q.)
+        Compute the violation of the local optimality condition for Heston.
+
+        Parameters
+        ----------
+        p : ndarray, shape (M, steps)
+            Adjoint process p.
+        q1 : ndarray, shape (M, steps-1)
+            Martingale component for dW1.
+        q2 : ndarray, shape (M, steps-1)
+            Martingale component for dW2.
+        eps : float, default=1e-12
+            Small constant for numerical stability in sqrt(v).
+
+        Returns
+        -------
+        G : ndarray, shape (M, steps-1)
+            Gradient like quantity used to update the control.
         """
-        S_path = self.S_path
-        v_path = self.v_path
-        mu = self.mu
-        kappa = self.kappa
-        theta = self.theta
+        assert p.shape == (self.M, self.steps)
+        assert q1.shape == (self.M, self.steps - 1)
+        assert q2.shape == (self.M, self.steps - 1)
 
-        M, steps = S_path.shape
-        assert p.shape == (M, steps)
-        assert q.shape == (M, steps - 1)
+        S_trunc = self.S_Heston[:, :-1]
+        v_trunc = np.maximum(self.v_Heston[:, :-1], 0.0)
+        sqrt_v = np.sqrt(v_trunc + eps)
 
-        S_trunc = S_path[:, :-1]
-        v_trunc = v_path[:, :-1]
-        sqrt_v  = np.sqrt(np.maximum(v_trunc, 1e-8))
+        G = (self.mu * S_trunc + self.kappa * (self.theta - v_trunc)) * p[:, :-1] \
+            + sqrt_v * S_trunc * q1 \
+            + self.sigma_v * sqrt_v * q2
 
-        G = (mu * S_trunc + kappa * (theta - v_trunc)) * p[:, :-1] \
-            + sqrt_v * S_trunc * q
         return G
 
-    # ============================================================
-    # 7. Control update
-    # ============================================================
 
-    @staticmethod
-    def update_control(
-        h: np.ndarray,
-        G: np.ndarray,
-        alpha: float,
-        max_G: float = 0.1,
-    ) -> np.ndarray:
-        assert h.shape == G.shape
-        G_clipped = np.clip(G, -max_G, max_G)
-        return h - alpha * G_clipped
 
     # ============================================================
     # 8. Main optimization loop
     # ============================================================
-
     def optimize_hedge(self,
                        risk_type: str,
                        risk_kwargs: Dict,
-                       max_iter: int = 50,
+                       t_idx: int = 0,
+                       max_iter: int = 20,
                        tol: float = 1e-4,
                        alpha: float = 1e-3,
                        verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+        """
+        Main optimization loop to compute an approximate optimal hedge h.
+        - Keep the last two accepted controls: h_curr (best/current), h_prev (previous).
+        - At each iteration, compute grad_norm at h_curr.
+        - If the first trial step from h_curr with current alpha does NOT improve grad_norm,
+            rollback immediately to h_prev, shrink alpha, and search from there.
+        - During the search, the anchor stays fixed; alpha is halved until improvement is found.
+        - If improvement cannot be found (alpha too small), stop.
 
-        h = self.init_control(kind="delta")
+        Parameters
+        ----------
+        risk_type : str
+            One of {"ele", "elw", "entl", "ente", "entw", "es"}.
+        risk_kwargs : dict
+            Parameters required for the chosen risk_type.
+        t_idx : int, default=0
+            Time index t at which P&L accumulation starts.
+        max_iter : int
+            Maximum number of iterations.
+        tol : float
+            Tolerance on E[G^2] (stopping criterion).
+        alpha : float
+            Step size for control updates.
+        verbose : bool
+            If True, print iteration logs.
+
+        Returns
+        -------
+        h_opt : ndarray, shape (M, steps-1)
+            Approximate optimal control.
+        history : list of dict
+            Iteration history (risk value, gradient norm, etc.).
+        """
+        h_curr = self.init_control(kind="Delta")
+        h_prev = None
+
         history: List[Dict] = []
 
+        shrink = 0.5
+        bt_max = 20
+        alpha_min = 1e-12
+
         for k in range(max_iter):
-            L = self.forward_PL(h, L0=0.0)
+            # ----- evaluate gradient norm at current accepted control -----
+            L = self.forward_PL(h_curr, L0=0.0, t_start=t_idx)
             LT = L[:, -1]
+            pT = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
 
-            rho = self.risk_function(LT, risk_type, **risk_kwargs)
-            pT, info = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
-            p, q = self.backward_adjoint(pT)
+            p, q1, q2 = self.backward_adjoint(pT)
+            G_curr = self.compute_gradient(p, q1, q2)
+            g_curr = np.linalg.norm(G_curr) / np.sqrt(G_curr.size)
 
-            G = self.compute_gradient(p, q)
-            grad_norm = np.mean(G**2)
-
-            history.append({"iter": k, "rho": rho, "grad_norm": grad_norm})
+            history.append({
+                "iter": k,
+                "phase": "base",
+                "alpha": alpha,
+                "grad_norm": g_curr,
+                "accepted": True
+            })
 
             if verbose:
-                print(f"iter {k:3d} | rho={rho:.6f} | grad_norm={grad_norm:.6e}")
+                print(f"iter {k:3d} | grad_norm={g_curr:.6e} | alpha={alpha:.2e}")
 
-            if grad_norm < tol:
+            if g_curr < tol:
                 break
 
-            h = self.update_control(h, G, alpha)
+            # ----- FIRST TRIAL from current point -----
+            alpha_try = alpha
+            h_try = self.update_control(h_curr, G_curr, alpha_try)
 
-        return h, history
+            L_try = self.forward_PL(h_try, L0=0.0, t_start=t_idx)
+            LT_try = L_try[:, -1]
+            pT_try = self.terminal_adjoint(LT_try, risk_type, **risk_kwargs)
+
+            p_try, q1_try, q2_try = self.backward_adjoint(pT_try)
+            G_try = self.compute_gradient(p_try, q1_try, q2_try)
+            g_try = np.linalg.norm(G_try) / np.sqrt(G_try.size)
+
+            first_accept = (g_try < g_curr)
+
+            history.append({
+                "iter": k,
+                "phase": "trial",
+                "alpha": alpha_try,
+                "grad_norm": g_try,
+                "accepted": first_accept
+            })
+
+            if verbose:
+                tag = "ACCEPT" if first_accept else "reject"
+                print(f"    trial    | alpha={alpha_try:.2e} | grad_norm={g_try:.6e} | {tag}")
+
+            if first_accept:
+                h_prev = h_curr
+                h_curr = h_try
+                continue
+
+            if k < 2:
+                if verbose:
+                    print("rollback disabled (k < 2)")
+                continue
+
+            # ----- ROLLBACK / BACKTRACKING ANCHOR -----
+            anchor_h = h_prev if (h_prev is not None) else h_curr
+            alpha_try = alpha * shrink
+
+            # recompute gradient at anchor (required)
+            L_a = self.forward_PL(anchor_h, L0=0.0, t_start=t_idx)
+            LT_a = L_a[:, -1]
+            pT_a = self.terminal_adjoint(LT_a, risk_type, **risk_kwargs)
+
+            p_a, q1_a, q2_a = self.backward_adjoint(pT_a)
+            G_a = self.compute_gradient(p_a, q1_a, q2_a)
+            g_a = np.linalg.norm(G_a) / np.sqrt(G_a.size)
+
+            history.append({
+                "iter": k,
+                "phase": "rollback_anchor" if (h_prev is not None) else "bt_anchor_curr",
+                "alpha": alpha_try,
+                "grad_norm": g_a,
+                "accepted": True
+            })
+
+            if verbose:
+                anc = "prev" if (h_prev is not None) else "curr"
+                print(f"    rollback | anchor={anc} | grad_norm={g_a:.6e} | alpha={alpha_try:.2e}")
+
+            accepted = False
+            for j in range(bt_max):
+                if alpha_try < alpha_min:
+                    break
+
+                h_new = self.update_control(anchor_h, G_a, alpha_try)
+
+                L_new = self.forward_PL(h_new, L0=0.0, t_start=t_idx)
+                LT_new = L_new[:, -1]
+                pT_new = self.terminal_adjoint(LT_new, risk_type, **risk_kwargs)
+
+                p_new, q1_new, q2_new = self.backward_adjoint(pT_new)
+                G_new = self.compute_gradient(p_new, q1_new, q2_new)
+                g_new = np.linalg.norm(G_new) / np.sqrt(G_new.size)
+
+                is_accept = (g_new < g_a)
+
+                history.append({
+                    "iter": k,
+                    "phase": "search_from_prev" if (h_prev is not None) else "search_from_curr",
+                    "search_step": j,
+                    "alpha": alpha_try,
+                    "grad_norm": g_new,
+                    "accepted": is_accept
+                })
+
+                if verbose:
+                    tag = "ACCEPT" if is_accept else "reject"
+                    print(f"    search {j:2d} | alpha={alpha_try:.2e} | grad_norm={g_new:.6e} | {tag}")
+
+                if is_accept:
+                    h_prev = anchor_h
+                    h_curr = h_new
+                    alpha = alpha_try
+                    accepted = True
+                    break
+
+                alpha_try *= shrink
+
+            if not accepted:
+                if verbose:
+                    print("no improving step found after rollback search (stopping).")
+                break
+
+        return h_curr, history
+    
+
+
+    # ============================================================
+    # 9. Maturity Risk computation
+    # ============================================================
+    def compute_MR(self,
+                   t_idx: int,
+                   risk_type: str,
+                   risk_kwargs: Dict,
+                   max_iter: int = 20,
+                   tol: float = 1e-4,
+                   alpha: float = 1e-3,
+                   verbose: bool = True) -> Tuple[float, Dict]:
+        """
+        Compute the maturity risk MR(t) via two optimal hedging problems.
+
+        The maturity risk is defined as the difference between:
+            - the optimal risk on the sub-horizon [t, T], and
+            - the optimal risk on the full horizon [0, T].
+
+            MR(t) = rho_t - rho_T
+
+        Parameters
+        ----------
+        t_idx : int
+            Time index t at which the maturity risk is evaluated.
+            Must satisfy 0 <= t_idx <= self.steps.
+        risk_type : str
+            Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
+        risk_kwargs : dict
+            Parameters required by the chosen risk functional.
+        max_iter : int, default=20
+            Maximum number of iterations in the hedge optimization.
+        tol : float, default=1e-4
+            Tolerance on the gradient norm (stopping criterion).
+        alpha : float, default=1e-3
+            Step size used in the control update.
+        verbose : bool, default=True
+            If True, prints optimization diagnostics.
+
+        Returns
+        -------
+        MR : float
+            Maturity risk at time index t_idx, defined as rho_t - rho_T.
+        info : dict
+            Dictionary containing:
+                - "h_T"   : optimal hedge on [0, T]
+                - "h_t"   : optimal hedge on [t, T]
+                - "rho_T" : optimal risk on [0, T]
+                - "rho_t" : optimal risk on [t, T]
+        """
+        assert 0 <= t_idx <= self.T
+
+        # --- full horizon [0, T] ---
+        h_T, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=self.T,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose,
+        )
+        L_T = self.forward_PL(h_T, L0=0.0, t_start=self.T)
+        rho_T = self.risk_function(L_T[:, -1], risk_type, **risk_kwargs)
+
+        # --- sub-horizon [t, T] ---
+        h_t, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=t_idx,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose
+        )
+        L_t = self.forward_PL(h_t, L0=0.0, t_start=t_idx)
+        rho_t = self.risk_function(L_t[:, -1], risk_type, **risk_kwargs)
+
+        MR = rho_t - rho_T
+
+        return MR, {"h_T": h_T, "h_t": h_t, "rho_T": rho_T, "rho_t": rho_t}
