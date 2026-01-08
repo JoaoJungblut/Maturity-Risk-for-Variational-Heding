@@ -358,7 +358,7 @@ class JumpDiffusionSimulator(BaseSimulator):
     # ============================================================
     # 1. Control initialization
     # ============================================================
-    def init_control(self, kind: str = "Delta") -> np.ndarray:
+    def init_control(self, kind: str = "MinVar") -> np.ndarray:
         """
         Initialize the control h.
 
@@ -716,7 +716,7 @@ class JumpDiffusionSimulator(BaseSimulator):
                     risk_type: str,
                     risk_kwargs: Dict,
                     t_idx: float = 0,
-                    kind: str = "Delta",
+                    kind: str = "MinVar",
                     max_iter: int = 20,
                     tol: float = 1e-4,
                     alpha: float = 1e-3,
@@ -907,7 +907,7 @@ class JumpDiffusionSimulator(BaseSimulator):
                 risk_type: str,
                 risk_kwargs: Dict,
                 t_idx: float =0,
-                kind: str = "Delta",
+                kind: str = "MinVar",
                 max_iter: int = 20,
                 tol: float = 1e-4,
                 alpha: float = 1e-3,
