@@ -765,6 +765,7 @@ class HestonSimulator(BaseSimulator):
                        risk_type: str,
                        risk_kwargs: Dict,
                        t_idx: int = 0,
+                       kind: str = "Delta",
                        max_iter: int = 20,
                        tol: float = 1e-4,
                        alpha: float = 1e-3,
@@ -786,6 +787,13 @@ class HestonSimulator(BaseSimulator):
             Parameters required for the chosen risk_type.
         t_idx : int, default=0
             Time index t at which P&L accumulation starts.
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
+
+            Delta  : h = dH_dS
+            MinVar : scalar h that minimizes the instantaneous diffusion variance
+                    implied by the two Brownian drivers under correlation.
+            zero   : h = 0
         max_iter : int
             Maximum number of iterations.
         tol : float
@@ -802,7 +810,7 @@ class HestonSimulator(BaseSimulator):
         history : list of dict
             Iteration history (risk value, gradient norm, etc.).
         """
-        h_curr = self.init_control(kind="Delta")
+        h_curr = self.init_control(kind=kind)
         h_prev = None
 
         history: List[Dict] = []
@@ -951,6 +959,7 @@ class HestonSimulator(BaseSimulator):
                    t_idx: int,
                    risk_type: str,
                    risk_kwargs: Dict,
+                   kind: str = "Delta",
                    max_iter: int = 20,
                    tol: float = 1e-4,
                    alpha: float = 1e-3,
@@ -973,6 +982,13 @@ class HestonSimulator(BaseSimulator):
             Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
         risk_kwargs : dict
             Parameters required by the chosen risk functional.
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
+
+            Delta  : h = dH_dS
+            MinVar : scalar h that minimizes the instantaneous diffusion variance
+                    implied by the two Brownian drivers under correlation.
+            zero   : h = 0
         max_iter : int, default=20
             Maximum number of iterations in the hedge optimization.
         tol : float, default=1e-4
@@ -1000,6 +1016,7 @@ class HestonSimulator(BaseSimulator):
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,
             t_idx=self.T,
+            kind=kind,
             max_iter=max_iter,
             tol=tol,
             alpha=alpha,
@@ -1013,6 +1030,7 @@ class HestonSimulator(BaseSimulator):
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,
             t_idx=t_idx,
+            kind=kind,
             max_iter=max_iter,
             tol=tol,
             alpha=alpha,

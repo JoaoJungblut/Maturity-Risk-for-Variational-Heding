@@ -131,7 +131,7 @@ class JumpDiffusionSimulator(BaseSimulator):
         self.dW_Jump = dW
         self.dN_Jump = dN
         self.ZJ_Jump = ZJ
-        self.J_Jump = J
+        self.J_Jump = np.hstack((np.ones((self.M, 1)), J))  # (M, steps)
 
         return S
 
@@ -409,6 +409,7 @@ class JumpDiffusionSimulator(BaseSimulator):
             raise ValueError("Unknown control initialization kind")
 
         return h0
+
 
 
     # ============================================================

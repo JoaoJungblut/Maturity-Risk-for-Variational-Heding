@@ -526,6 +526,7 @@ class GBMSimulator(BaseSimulator):
                     risk_type: str,
                     risk_kwargs: Dict,
                     t_idx: int = 0,
+                    kind: str = "Delta",
                     max_iter: int = 20,
                     tol: float = 1e-4,
                     alpha: float = 1e-3,
@@ -547,6 +548,8 @@ class GBMSimulator(BaseSimulator):
             Parameters required for the chosen risk_type.
         t_idx : int, default=0
             Time index t at which P&L accumulation starts.
+        kind : {"Delta", "zero"}
+            Initialization rule.
         max_iter : int
             Maximum number of iterations.
         tol : float
@@ -563,7 +566,7 @@ class GBMSimulator(BaseSimulator):
         history : list of dict
             Iteration history (risk value, gradient norm, etc.).
         """
-        h_curr = self.init_control(kind="Delta")
+        h_curr = self.init_control(kind=kind)
         h_prev = None
 
         history: List[Dict] = []
@@ -709,6 +712,7 @@ class GBMSimulator(BaseSimulator):
                    t_idx: int,
                    risk_type: str,
                    risk_kwargs: Dict,
+                   kind: str = "Delta",
                    max_iter: int = 20,
                    tol: float = 1e-4,
                    alpha: float = 1e-3,
@@ -731,6 +735,8 @@ class GBMSimulator(BaseSimulator):
             Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
         risk_kwargs : dict
             Parameters required by the chosen risk functional.
+        kind : {"Delta", "zero"}
+            Initialization rule.    
         max_iter : int, default=20
             Maximum number of iterations in the hedge optimization.
         tol : float, default=1e-4
@@ -758,6 +764,7 @@ class GBMSimulator(BaseSimulator):
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,
             t_idx=self.T,
+            kind = kind,
             max_iter=max_iter,
             tol=tol,
             alpha=alpha,
@@ -771,6 +778,7 @@ class GBMSimulator(BaseSimulator):
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,
             t_idx=t_idx,
+            kind = kind,
             max_iter=max_iter,
             tol=tol,
             alpha=alpha,
