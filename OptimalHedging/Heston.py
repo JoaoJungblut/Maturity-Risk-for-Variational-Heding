@@ -494,7 +494,7 @@ class HestonSimulator(BaseSimulator):
     def forward_PL(self,
                    h: np.ndarray,
                    L0: float = 0.0,
-                   t_start: int = 0) -> np.ndarray:
+                   t_start: float = 0) -> np.ndarray:
         """
         Vectorized Profit and Loss L_t using portfolio value.
 
@@ -716,7 +716,7 @@ class HestonSimulator(BaseSimulator):
 
 
     # ============================================================
-    # 6. Gradient (aqui entra o ∂_h H correto do Heston sem q^ν)
+    # 6. Gradient (optimality condition)
     # ============================================================
     def compute_gradient(self,
                          p: np.ndarray,
@@ -764,7 +764,7 @@ class HestonSimulator(BaseSimulator):
     def optimize_hedge(self,
                        risk_type: str,
                        risk_kwargs: Dict,
-                       t_idx: int = 0,
+                       t_idx: float = 0,
                        kind: str = "Delta",
                        max_iter: int = 20,
                        tol: float = 1e-4,
@@ -785,7 +785,7 @@ class HestonSimulator(BaseSimulator):
             One of {"ele", "elw", "entl", "ente", "entw", "es"}.
         risk_kwargs : dict
             Parameters required for the chosen risk_type.
-        t_idx : int, default=0
+        t_idx : float, default=0
             Time index t at which P&L accumulation starts.
         kind : {"Delta", "MinVar", "zero"}
             Initialization rule.
@@ -956,9 +956,9 @@ class HestonSimulator(BaseSimulator):
     # 9. Maturity Risk computation
     # ============================================================
     def compute_MR(self,
-                   t_idx: int,
                    risk_type: str,
                    risk_kwargs: Dict,
+                   t_idx: float = 0,
                    kind: str = "Delta",
                    max_iter: int = 20,
                    tol: float = 1e-4,
@@ -975,7 +975,7 @@ class HestonSimulator(BaseSimulator):
 
         Parameters
         ----------
-        t_idx : int
+        t_idx : float
             Time index t at which the maturity risk is evaluated.
             Must satisfy 0 <= t_idx <= self.steps.
         risk_type : str
@@ -1011,7 +1011,7 @@ class HestonSimulator(BaseSimulator):
         """
         assert 0 <= t_idx <= self.T
 
-        # --- full horizon [0, T] ---
+        # --- at maturity [, T] ---
         h_T, _ = self.optimize_hedge(
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,

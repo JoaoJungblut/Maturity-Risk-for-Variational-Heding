@@ -417,7 +417,7 @@ class JumpDiffusionSimulator(BaseSimulator):
     # ============================================================
     def forward_PL(self,
                 h: np.ndarray,
-                L0: float = 0.0,
+                L0: float = 0,
                 t_start: int = 0) -> np.ndarray:
         """
         Vectorized Profit and Loss L_t using portfolio value.
@@ -466,135 +466,524 @@ class JumpDiffusionSimulator(BaseSimulator):
     # ============================================================
     # 5. Backward adjoint: agora com r_t (salto)
     # ============================================================
+    def backward_adjoint(self,
+                        pT: np.ndarray,
+                        p_x: int = 2,
+                        lam_ridge: float = 1e-2,
+                        lam_time: float = 1e-2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Solve the backward adjoint BSDE for the Merton jump diffusion model
+        by a discrete-time backward scheme combined with regression.
 
-    def backward_adjoint(self, pT):
-        S_path    = self.S_path
-        dW        = self.dW
-        dN        = self.dN
-        d2H_dt_dS = self.d2H_dt_dS
-        d2H_dSS   = self.d2H_dSS
-        d3H_dS3   = self.d3H_dS3
-        mu, sigma, dt = self.mu, self.sigma, self.dt
+        Numerical scheme
+        ----------------
+        - Time is discretized on the same grid used for the forward simulation.
+        - The backward equation is solved iteratively for n = N-1, ..., 0.
+        - Three backward processes are estimated:
+            * p_n : adjoint process
+            * q_n : martingale component for the Brownian motion
+            * r_n : martingale component for the Poisson jump process
+        - For each n:
+            * q_n is obtained from the martingale representation
+            q_n = E[p_{n+1} Delta W_n | S_n] / Delta t.
+            * r_n is obtained from the martingale representation
+            r_n = E[p_{n+1} Delta N_n | S_n] / Delta t.
+            * p_n is obtained from the drift part of the adjoint dynamics,
+            using a first-order Euler discretization that includes the
+            second- and third-order sensitivities of H(t,S) and the
+            jump sensitivity term involving H_S(t, J S).
 
-        M, steps = S_path.shape
-        p = np.zeros((M, steps))
-        q = np.zeros((M, steps-1))
-        r = np.zeros((M, steps-1))
-        p[:, -1] = pT
+        Parameters
+        ----------
+        pT : ndarray, shape (M,)
+            Terminal adjoint values p_T, obtained from the derivative of the
+            terminal risk functional with respect to the terminal P and L.
+        p_x : int, default=2
+            Degree of the Chebyshev polynomial basis used in the regression.
+        lam_ridge : float, default=1e-2
+            Ridge regularization parameter for the cross-sectional regressions.
+        lam_time : float, default=1e-2
+            Temporal smoothing parameter for regression coefficients across time.
 
-        for n in reversed(range(steps-1)):
-            Sn  = S_path[:, n]
-            dWn = dW[:, n]
-            dNn = dN[:, n]
+        Returns
+        -------
+        p : ndarray, shape (M, steps)
+            Backward adjoint process p_t along each simulated path.
+        q : ndarray, shape (M, steps-1)
+            Martingale component q_t of the adjoint process (Brownian).
+        r : ndarray, shape (M, steps-1)
+            Martingale component r_t of the adjoint process (Poisson jumps).
+        """
+        if getattr(self, "S_Jump", None) is None:
+            raise ValueError("Missing S_Jump. Run simulate_S() first.")
+        if getattr(self, "dW_Jump", None) is None:
+            raise ValueError("Missing dW_Jump. Run simulate_S() first.")
+        if getattr(self, "dN_Jump", None) is None:
+            raise ValueError("Missing dN_Jump. Run simulate_S() first.")
+        if getattr(self, "J_Jump", None) is None:
+            raise ValueError("Missing J_Jump. Run simulate_S() first.")
 
-            d2H_dt_dS_n = 100.0 * d2H_dt_dS[:, n]
-            d2H_dSS_n   = d2H_dSS[:, n]
-            d3H_dS3_n   = d3H_dS3[:, n]
+        req = [
+            "dH_dS_Jump",
+            "d2H_dSS_Jump",
+            "d2H_dtdS_Jump",
+            "d3H_dS3_Jump",
+            "dH_dS_jump_Jump",
+        ]
+        for name in req:
+            if getattr(self, name, None) is None:
+                raise ValueError(f"Missing {name}. Run simulate_H() first.")
 
-            # A_n igual ao GBM (driver difusivo)
-            A_n = d2H_dt_dS_n + 0.5 * sigma**2 * (
-                2.0 * Sn * d2H_dSS_n + (Sn**2) * d3H_dS3_n
+        # ------------------------------------------------------------
+        # 1) Allocate backward processes
+        # ------------------------------------------------------------
+        p = np.zeros((self.M, self.steps), dtype=float)
+        q = np.zeros((self.M, self.steps - 1), dtype=float)
+        r = np.zeros((self.M, self.steps - 1), dtype=float)
+        p[:, -1] = np.asarray(pT, dtype=float)
+
+        # ------------------------------------------------------------
+        # 2) Global regressor: x = log(S)
+        # ------------------------------------------------------------
+        S_all = np.maximum(self.S_Jump, 1e-300)
+        X_all = np.log(S_all)
+
+        x_min = float(X_all.min())
+        x_max = float(X_all.max())
+        if (not np.isfinite(x_min)) or (not np.isfinite(x_max)) or (x_max <= x_min):
+            raise ValueError("Invalid scaling range for log(S).")
+
+        P = p_x + 1
+        beta_p_next = np.zeros(P)
+        beta_q_next = np.zeros(P)
+        beta_r_next = np.zeros(P)
+
+        # ------------------------------------------------------------
+        # 3) Backward loop
+        # ------------------------------------------------------------
+        for n in range(self.steps - 2, -1, -1):
+            Sn = self.S_Jump[:, n]
+            dWn = self.dW_Jump[:, n]
+            dNn = self.dN_Jump[:, n]
+
+            # jump size aligned to time index n
+            # - if J_Jump is stored per interval, use J_Jump[:, n]
+            # - if J_Jump is stored on the full grid, use J_Jump[:, n]
+            Jbuf = self.J_Jump
+            if Jbuf.ndim != 2 or Jbuf.shape[0] != self.M:
+                raise ValueError("Invalid shape for J_Jump.")
+            if Jbuf.shape[1] == self.steps - 1:
+                Jn = Jbuf[:, n]
+            elif Jbuf.shape[1] == self.steps:
+                Jn = Jbuf[:, n]
+            else:
+                raise ValueError("J_Jump must have shape (M, steps-1) or (M, steps).")
+
+            # --------------------------------------------------------
+            # 3.1) Regressors: phi(x_n)
+            # --------------------------------------------------------
+            x_n = X_all[:, n]
+            z = tools._minmax_scale(x_n, x_min, x_max)
+            Phi = tools._cheb_eval_all(z, p_x, deriv=0)
+
+            p_next = p[:, n + 1]
+
+            # --------------------------------------------------------
+            # 3.2) q_n via martingale representation
+            # --------------------------------------------------------
+            y_q = (p_next * dWn) / self.dt
+            beta_q = tools._solve_smoothed(Phi, y_q, beta_q_next, lam_ridge, lam_time)
+            q[:, n] = Phi @ beta_q
+
+            # --------------------------------------------------------
+            # 3.3) r_n via martingale representation
+            # --------------------------------------------------------
+            y_r = (p_next * dNn) / self.dt
+            beta_r = tools._solve_smoothed(Phi, y_r, beta_r_next, lam_ridge, lam_time)
+            r[:, n] = Phi @ beta_r
+
+            # --------------------------------------------------------
+            # 3.4) Driver terms (paper equation for jump diffusion adjoint)
+            # --------------------------------------------------------
+            H_S = self.dH_dS_Jump[:, n]
+            H_SS = self.d2H_dSS_Jump[:, n]
+            H_tS = self.d2H_dtdS_Jump[:, n]
+            H_SSS = self.d3H_dS3_Jump[:, n]
+            H_S_jump = self.dH_dS_jump_Jump[:, n]
+
+            # alpha_n multiplies p
+            alpha_n = (
+                H_tS
+                + self.mu * Sn * H_SS
+                + 0.5 * (self.sigma ** 2) * (Sn ** 2) * H_SSS
+                + (self.sigma ** 2) * Sn * H_SS
             )
 
-            p_next = p[:, n+1]
-            p_n = p_next - A_n * p_next * dt
-            p[:, n] = p_n
+            # beta_n multiplies q with a minus sign
+            beta_n = self.sigma * (H_S + Sn * H_SS)
 
-            # parte martingale: q dW + r dN
-            mart = p_next - p_n - A_n * p_n * dt
+            # gamma_n multiplies r with a minus sign
+            gamma_n = (Jn - 1.0) - (Jn * H_S_jump - H_S)
 
-            # estima q usando apenas caminhos sem salto
-            q_n = np.zeros(M)
-            mask_nojump = (dNn == 0) & (np.abs(dWn) > 1e-8)
-            q_n[mask_nojump] = mart[mask_nojump] / dWn[mask_nojump]
+            # full drift for p at time n (evaluated using p_next, q_n, r_n)
+            drift_p = alpha_n * p_next - beta_n * q[:, n] - gamma_n * r[:, n]
 
-            # para o resto, reaproveita q do passo seguinte ou zera
-            if n < steps - 2:
-                q_n[~mask_nojump] = q[:, n+1][~mask_nojump]
-            q[:, n] = q_n
+            # --------------------------------------------------------
+            # 3.5) p_n via Euler drift and denoising regression
+            # --------------------------------------------------------
+            y_p = p_next - drift_p * self.dt
+            beta_p = tools._solve_smoothed(Phi, y_p, beta_p_next, lam_ridge, lam_time)
+            p[:, n] = Phi @ beta_p
 
-            # agora estima r para caminhos que saltaram
-            r_n = np.zeros(M)
-            mask_jump = (dNn > 0)
-            if np.any(mask_jump):
-                r_n[mask_jump] = (mart[mask_jump] - q_n[mask_jump] * dWn[mask_jump]) / dNn[mask_jump]
-            r[:, n] = r_n
+            # update smoothed coefficient states
+            beta_q_next = beta_q
+            beta_r_next = beta_r
+            beta_p_next = beta_p
+
+        # ------------------------------------------------------------
+        # 4) Store regression metadata
+        # ------------------------------------------------------------
+        self._backward_fit_Jump = {
+            "p_x": p_x,
+            "lam_ridge": lam_ridge,
+            "lam_time": lam_time,
+            "x_min": x_min,
+            "x_max": x_max,
+        }
+
+        self.p_Jump = p
+        self.q_Jump = q
+        self.r_Jump = r
 
         return p, q, r
 
+
+
     # ============================================================
-    # 6. Gradient: ∂_h H = μ S p + σ S q + S(J-1) r
+    # 6. Gradient (optimality condition)
     # ============================================================
+    def compute_gradient(self,
+                        p: np.ndarray,
+                        q: np.ndarray,
+                        r: np.ndarray) -> np.ndarray:
+        """
+        Compute the violation of the local optimality condition for Merton jump diffusion.
 
-    def compute_gradient(self, p: np.ndarray, q: np.ndarray, r: np.ndarray) -> np.ndarray:
-        S_path = self.S_path
-        J      = self.J
-        mu = self.mu
-        sigma = self.sigma
+        Paper first order condition:
+            0 = mu S_t p_t + sigma S_t q_t + S_{t-} (J - 1) r_t
 
-        M, steps = S_path.shape
-        assert p.shape == (M, steps)
-        assert q.shape == (M, steps - 1)
-        assert r.shape == (M, steps - 1)
+        Parameters
+        ----------
+        p : ndarray, shape (M, steps)
+            Adjoint process p.
+        q : ndarray, shape (M, steps-1)
+            Martingale component for dW.
+        r : ndarray, shape (M, steps-1)
+            Martingale component for dN.
 
-        S_trunc = S_path[:, :-1]
-        J_trunc = J  # (M, steps-1)
+        Returns
+        -------
+        G : ndarray, shape (M, steps-1)
+            Gradient like quantity used to update the control.
+        """
+        assert p.shape == (self.M, self.steps)
+        assert q.shape == (self.M, self.steps - 1)
+        assert r.shape == (self.M, self.steps - 1)
 
-        G = mu * S_trunc * p[:, :-1] \
-            + sigma * S_trunc * q \
-            + S_trunc * (J_trunc - 1.0) * r
+        S_trunc = self.S_Jump[:, :-1]
+
+        # J aligned to increments on [t_n, t_{n+1})
+        Jbuf = self.J_Jump
+        if Jbuf.shape[1] == self.steps - 1:
+            J_trunc = Jbuf
+        elif Jbuf.shape[1] == self.steps:
+            J_trunc = Jbuf[:, :-1]
+        else:
+            raise ValueError("J_Jump must have shape (M, steps-1) or (M, steps).")
+
+        G = (self.mu * S_trunc) * p[:, :-1] \
+            + (self.sigma * S_trunc) * q \
+            + (S_trunc * (J_trunc - 1.0)) * r
 
         return G
 
-    # ============================================================
-    # 7. Control update
-    # ============================================================
 
-    @staticmethod
-    def update_control(
-        h: np.ndarray,
-        G: np.ndarray,
-        alpha: float,
-        max_G: float = 0.1,
-    ) -> np.ndarray:
-        assert h.shape == G.shape
-        G_clipped = np.clip(G, -max_G, max_G)
-        return h - alpha * G_clipped
 
     # ============================================================
     # 8. Main optimization loop
     # ============================================================
-
     def optimize_hedge(self,
-                       risk_type: str,
-                       risk_kwargs: Dict,
-                       max_iter: int = 50,
-                       tol: float = 1e-4,
-                       alpha: float = 1e-3,
-                       verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+                    risk_type: str,
+                    risk_kwargs: Dict,
+                    t_idx: float = 0,
+                    kind: str = "Delta",
+                    max_iter: int = 20,
+                    tol: float = 1e-4,
+                    alpha: float = 1e-3,
+                    verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+        """
+        Main optimization loop to compute an approximate optimal hedge h for jump diffusion.
 
-        h = self.init_control(kind="delta")
+        Same structure as GBM:
+        - Keep the last two accepted controls: h_curr (best/current), h_prev (previous).
+        - At each iteration, compute grad_norm at h_curr.
+        - If the first trial step from h_curr with current alpha does NOT improve grad_norm,
+        rollback immediately to h_prev, shrink alpha, and search from there.
+        - During the search, the anchor stays fixed; alpha is halved until improvement is found.
+        - If improvement cannot be found (alpha too small), stop.
+
+        Parameters
+        ----------
+        risk_type : str
+            One of {"ele", "elw", "entl", "ente", "entw", "esl"}.
+        risk_kwargs : dict
+            Parameters required for the chosen risk_type.
+        t_idx : float, default=0
+            Time index t at which P and L accumulation starts.
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
+        max_iter : int
+            Maximum number of iterations.
+        tol : float
+            Tolerance on mean square gradient (stopping criterion).
+        alpha : float
+            Step size for control updates.
+        verbose : bool
+            If True, print iteration logs.
+
+        Returns
+        -------
+        h_opt : ndarray, shape (M, steps-1)
+            Approximate optimal control.
+        history : list of dict
+            Iteration history (gradient norm, etc.).
+        """
+        h_curr = self.init_control(kind=kind)
+        h_prev = None
+
         history: List[Dict] = []
 
-        for k in range(max_iter):
-            L = self.forward_PL(h, L0=0.0)
-            LT = L[:, -1]
+        shrink = 0.5
+        bt_max = 20
+        alpha_min = 1e-12
 
-            rho = self.risk_function(LT, risk_type, **risk_kwargs)
-            pT, info = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
+        for k in range(max_iter):
+            # ----- evaluate gradient norm at current accepted control -----
+            L = self.forward_PL(h_curr, L0=0.0, t_start=t_idx)
+            LT = L[:, -1]
+            pT = self.terminal_adjoint(LT, risk_type, **risk_kwargs)
 
             p, q, r = self.backward_adjoint(pT)
-            G = self.compute_gradient(p, q, r)
-            grad_norm = np.mean(G**2)
+            G_curr = self.compute_gradient(p, q, r)
+            g_curr = np.linalg.norm(G_curr) / np.sqrt(G_curr.size)
 
-            history.append({"iter": k, "rho": rho, "grad_norm": grad_norm})
+            history.append({
+                "iter": k,
+                "phase": "base",
+                "alpha": alpha,
+                "grad_norm": g_curr,
+                "accepted": True
+            })
 
             if verbose:
-                print(f"iter {k:3d} | rho={rho:.6f} | grad_norm={grad_norm:.6e}")
+                print(f"iter {k:3d} | grad_norm={g_curr:.6e} | alpha={alpha:.2e}")
 
-            if grad_norm < tol:
+            if g_curr < tol:
                 break
 
-            h = self.update_control(h, G, alpha)
+            # ----- FIRST TRIAL from current point -----
+            alpha_try = alpha
+            h_try = self.update_control(h_curr, G_curr, alpha_try)
 
-        return h, history
+            L_try = self.forward_PL(h_try, L0=0.0, t_start=t_idx)
+            LT_try = L_try[:, -1]
+            pT_try = self.terminal_adjoint(LT_try, risk_type, **risk_kwargs)
+
+            p_try, q_try, r_try = self.backward_adjoint(pT_try)
+            G_try = self.compute_gradient(p_try, q_try, r_try)
+            g_try = np.linalg.norm(G_try) / np.sqrt(G_try.size)
+
+            first_accept = (g_try < g_curr)
+
+            history.append({
+                "iter": k,
+                "phase": "trial",
+                "alpha": alpha_try,
+                "grad_norm": g_try,
+                "accepted": first_accept
+            })
+
+            if verbose:
+                tag = "ACCEPT" if first_accept else "reject"
+                print(f"    trial    | alpha={alpha_try:.2e} | grad_norm={g_try:.6e} | {tag}")
+
+            if first_accept:
+                h_prev = h_curr
+                h_curr = h_try
+                continue
+
+            if k < 2:
+                if verbose:
+                    print("rollback disabled (k < 2)")
+                continue
+
+            # ----- ROLLBACK / BACKTRACKING ANCHOR -----
+            anchor_h = h_prev if (h_prev is not None) else h_curr
+            alpha_try = alpha * shrink
+
+            # recompute gradient at anchor (required)
+            L_a = self.forward_PL(anchor_h, L0=0.0, t_start=t_idx)
+            LT_a = L_a[:, -1]
+            pT_a = self.terminal_adjoint(LT_a, risk_type, **risk_kwargs)
+
+            p_a, q_a, r_a = self.backward_adjoint(pT_a)
+            G_a = self.compute_gradient(p_a, q_a, r_a)
+            g_a = np.linalg.norm(G_a) / np.sqrt(G_a.size)
+
+            history.append({
+                "iter": k,
+                "phase": "rollback_anchor" if (h_prev is not None) else "bt_anchor_curr",
+                "alpha": alpha_try,
+                "grad_norm": g_a,
+                "accepted": True
+            })
+
+            if verbose:
+                anc = "prev" if (h_prev is not None) else "curr"
+                print(f"    rollback | anchor={anc} | grad_norm={g_a:.6e} | alpha={alpha_try:.2e}")
+
+            accepted = False
+            for j in range(bt_max):
+                if alpha_try < alpha_min:
+                    break
+
+                h_new = self.update_control(anchor_h, G_a, alpha_try)
+
+                L_new = self.forward_PL(h_new, L0=0.0, t_start=t_idx)
+                LT_new = L_new[:, -1]
+                pT_new = self.terminal_adjoint(LT_new, risk_type, **risk_kwargs)
+
+                p_new, q_new, r_new = self.backward_adjoint(pT_new)
+                G_new = self.compute_gradient(p_new, q_new, r_new)
+                g_new = np.linalg.norm(G_new) / np.sqrt(G_new.size)
+
+                is_accept = (g_new < g_a)
+
+                history.append({
+                    "iter": k,
+                    "phase": "search_from_prev" if (h_prev is not None) else "search_from_curr",
+                    "search_step": j,
+                    "alpha": alpha_try,
+                    "grad_norm": g_new,
+                    "accepted": is_accept
+                })
+
+                if verbose:
+                    tag = "ACCEPT" if is_accept else "reject"
+                    print(f"    search {j:2d} | alpha={alpha_try:.2e} | grad_norm={g_new:.6e} | {tag}")
+
+                if is_accept:
+                    h_prev = anchor_h
+                    h_curr = h_new
+                    alpha = alpha_try
+                    accepted = True
+                    break
+
+                alpha_try *= shrink
+
+            if not accepted:
+                if verbose:
+                    print("no improving step found after rollback search (stopping).")
+                break
+
+        return h_curr, history
+    
+
+
+    # ============================================================
+    # 9. Maturity Risk computation
+    # ============================================================
+    def compute_MR(self,
+                risk_type: str,
+                risk_kwargs: Dict,
+                t_idx: float =0,
+                kind: str = "Delta",
+                max_iter: int = 20,
+                tol: float = 1e-4,
+                alpha: float = 1e-3,
+                verbose: bool = True) -> Tuple[float, Dict]:
+        """
+        Compute the maturity risk MR(t) via two optimal hedging problems.
+
+        The maturity risk is defined as the difference between:
+            - the optimal risk on the sub-horizon [t, T], and
+            - the optimal risk on the full horizon [0, T].
+
+            MR(t) = rho_t - rho_T
+
+        Parameters
+        ----------
+        t_idx : float
+            Time index t at which the maturity risk is evaluated.
+            Must satisfy 0 <= t_idx <= self.steps.
+        risk_type : str
+            Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
+        risk_kwargs : dict
+            Parameters required by the chosen risk functional.
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
+        max_iter : int, default=20
+            Maximum number of iterations in the hedge optimization.
+        tol : float, default=1e-4
+            Tolerance on the gradient norm (stopping criterion).
+        alpha : float, default=1e-3
+            Step size used in the control update.
+        verbose : bool, default=True
+            If True, prints optimization diagnostics.
+
+        Returns
+        -------
+        MR : float
+            Maturity risk at time index t_idx, defined as rho_t - rho_T.
+        info : dict
+            Dictionary containing:
+                - "h_T"   : optimal hedge on [0, T]
+                - "h_t"   : optimal hedge on [t, T]
+                - "rho_T" : optimal risk on [0, T]
+                - "rho_t" : optimal risk on [t, T]
+        """
+        assert 0 <= t_idx <= self.T
+
+        # --- at maturity [, T] ---
+        h_T, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=self.T,
+            kind=kind,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose,
+        )
+        L_T = self.forward_PL(h_T, L0=0.0, t_start=self.T)
+        rho_T = self.risk_function(L_T[:, -1], risk_type, **risk_kwargs)
+
+        # --- sub-horizon [t, T] ---
+        h_t, _ = self.optimize_hedge(
+            risk_type=risk_type,
+            risk_kwargs=risk_kwargs,
+            t_idx=t_idx,
+            kind=kind,
+            max_iter=max_iter,
+            tol=tol,
+            alpha=alpha,
+            verbose=verbose,
+        )
+        L_t = self.forward_PL(h_t, L0=0.0, t_start=t_idx)
+        rho_t = self.risk_function(L_t[:, -1], risk_type, **risk_kwargs)
+
+        MR = rho_t - rho_T
+
+        return MR, {"h_T": h_T, "h_t": h_t, "rho_T": rho_T, "rho_t": rho_t}
+
+

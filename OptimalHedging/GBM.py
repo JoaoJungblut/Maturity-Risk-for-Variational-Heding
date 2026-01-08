@@ -333,7 +333,7 @@ class GBMSimulator(BaseSimulator):
     def forward_PL(self,
                    h: np.ndarray,
                    L0: float = 0.0,
-                   t_start: int = 0) -> np.ndarray:
+                   t_start: float = 0) -> np.ndarray:
         """
         Vectorized Profit and Loss L_t using portfolio value.
 
@@ -379,7 +379,7 @@ class GBMSimulator(BaseSimulator):
 
 
     # ============================================================
-    # 5. Backward adjoint (simplified driver)
+    # 5. Backward adjoint 
     # ============================================================
     def backward_adjoint(self,
                          pT: float,
@@ -525,7 +525,7 @@ class GBMSimulator(BaseSimulator):
     def optimize_hedge(self,
                     risk_type: str,
                     risk_kwargs: Dict,
-                    t_idx: int = 0,
+                    t_idx: float = 0,
                     kind: str = "Delta",
                     max_iter: int = 20,
                     tol: float = 1e-4,
@@ -546,7 +546,7 @@ class GBMSimulator(BaseSimulator):
             One of {"ele", "elw", "entl", "ente", "entw", "es"}.
         risk_kwargs : dict
             Parameters required for the chosen risk_type.
-        t_idx : int, default=0
+        t_idx : float, default=0
             Time index t at which P&L accumulation starts.
         kind : {"Delta", "zero"}
             Initialization rule.
@@ -759,7 +759,7 @@ class GBMSimulator(BaseSimulator):
         """
         assert 0 <= t_idx <= self.T
 
-        # --- full horizon [0, T] ---
+        # --- at maturity [, T] ---
         h_T, _ = self.optimize_hedge(
             risk_type=risk_type,
             risk_kwargs=risk_kwargs,

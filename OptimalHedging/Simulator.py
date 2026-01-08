@@ -108,13 +108,13 @@ class BaseSimulator(ABC):
     # ============================================================
 
     @abstractmethod
-    def init_control(self, kind: str = "delta") -> np.ndarray:
+    def init_control(self, kind: str = "Delta") -> np.ndarray:
         """
         Initialize the control h.
 
         Parameters
         ----------
-        kind : {"delta", "zero"}
+        kind : {"Delta", "zero"}
             Initialization rule.
 
         Returns
@@ -129,7 +129,10 @@ class BaseSimulator(ABC):
     # ============================================================
 
     @abstractmethod
-    def forward_PL(self, h: np.ndarray, L0: float = 0.0) -> np.ndarray:
+    def forward_PL(self, 
+                   h: np.ndarray, 
+                   L0: float = 0.0,
+                   t_start: float = 0) -> np.ndarray:
         """
         Simulate the P&L L_t given the control h.
 
@@ -139,6 +142,8 @@ class BaseSimulator(ABC):
             Control on each interval [t_n, t_{n+1}).
         L0 : float, default=0.0
             Initial P&L.
+        t_start : float, default=0
+            Time index t at which Profit and Loss accumulation starts.
 
         Returns
         -------
@@ -443,6 +448,7 @@ class BaseSimulator(ABC):
     def optimize_hedge(self,
                        risk_type: str,
                        risk_kwargs: Dict,
+                       t_idx: float = 0,
                        max_iter: int = 20,
                        tol: float = 1e-4,
                        alpha: float = 1e-3,
@@ -456,6 +462,8 @@ class BaseSimulator(ABC):
             One of {"ele", "elw", "entl", "ente", "entw", "es"}.
         risk_kwargs : dict
             Parameters required for the chosen risk_type.
+        t_idx : float, default=0
+            Time index t at which P&L accumulation starts.
         max_iter : int
             Maximum number of iterations.
         tol : float
@@ -478,10 +486,11 @@ class BaseSimulator(ABC):
     # 9. Maturity Risk computation
     # ============================================================
     def compute_MR(self,
-                   t_idx: int,
                    risk_type: str,
                    risk_kwargs: Dict,
+                   t_idx: float = 0,
                    max_iter: int = 20,
+                   kind: str = "Delta",
                    tol: float = 1e-4,
                    alpha: float = 1e-3,
                    verbose: bool = True) -> Tuple[float, Dict]:
@@ -496,13 +505,15 @@ class BaseSimulator(ABC):
 
         Parameters
         ----------
-        t_idx : int
+        t_idx : float
             Time index t at which the maturity risk is evaluated.
             Must satisfy 0 <= t_idx <= self.steps.
         risk_type : str
             Risk functional identifier (e.g. "ele", "elw", "entl", "ente", "entw", "esl").
         risk_kwargs : dict
             Parameters required by the chosen risk functional.
+        kind : {"Delta", "MinVar", "zero"}
+            Initialization rule.
         max_iter : int, default=20
             Maximum number of iterations in the hedge optimization.
         tol : float, default=1e-4
